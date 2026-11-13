@@ -1329,3 +1329,62 @@ fn follow_tails_new_lines_but_copying_freezes_the_view() {
     let _ = app.runner.stop(&id);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Spring Boot colourises its own output; the pane must show the text, not the
+/// escape codes. Plain `[34m` text (already stripped, or literal in the log)
+/// must survive untouched.
+#[test]
+fn ansi_escapes_are_removed_but_plain_brackets_survive() {
+    use crate::runner::strip_ansi;
+
+    let nacos = "\u{1b}[34mINFO \u{1b}[0;39m \u{1b}[36mc.a.cloud.nacos.registry.NacosServiceRegistry:75\u{1b}[0;39m - nacos registry, DEFAULT_GROUP synergy-file 192.168.10.210:7010 register finished";
+    assert_eq!(
+        strip_ansi(nacos),
+        "INFO  c.a.cloud.nacos.registry.NacosServiceRegistry:75 - nacos registry, DEFAULT_GROUP synergy-file 192.168.10.210:7010 register finished"
+    );
+
+    assert_eq!(strip_ansi("\u{1b}]0;tspb\u{7}titled"), "titled");
+    assert_eq!(strip_ansi("\u{1b}]0;tspb\u{1b}\\titled"), "titled");
+    assert_eq!(strip_ansi("\u{1b}7a\u{1b}(Bb"), "ab");
+    assert_eq!(strip_ansi("no escapes here"), "no escapes here");
+    assert_eq!(strip_ansi("list[0] = [34m"), "list[0] = [34m");
+    assert_eq!(strip_ansi("\u{1b}[2K\r"), "\r");
+    assert_eq!(strip_ansi("\u{1b}"), "");
+}
+
+/// End to end through the real pipe: a shim that echoes colourised text.
+#[cfg(windows)]
+#[test]
+fn colour_codes_never_reach_the_log_buffer() {
+    let jdk = Jdk {
+        name: "test-jdk".into(),
+        home: std::env::temp_dir(),
+        version: "17".into(),
+        java: PathBuf::from("java.exe"),
+        origin: Origin::Env,
+    };
+    let mut runner = Runner::new(100);
+    let script =
+        "@echo off\r\necho \u{1b}[34mINFO \u{1b}[0;39m booted\r\nping -n 30 127.0.0.1 >nul\r\n";
+    let (project, id) = fake_service_script("svc-ansi", script, &jdk, &mut runner);
+    let tmp = project.path.clone();
+    wait_for_line(&mut runner, &id, "booted");
+
+    let logs = runner.logs_for(&id);
+    let line = logs
+        .iter()
+        .find(|l| l.contains("booted"))
+        .expect("the colourised line is captured");
+    assert!(
+        !line.contains('\u{1b}'),
+        "escape bytes must not reach the buffer: {line:?}"
+    );
+    assert!(
+        !line.contains("[34m") && !line.contains("[0;39m"),
+        "leftover SGR params must not be rendered as text: {line:?}"
+    );
+    assert!(line.contains("INFO  booted"), "the text survives: {line:?}");
+
+    let _ = runner.stop(&id);
+    let _ = std::fs::remove_dir_all(&tmp);
+}

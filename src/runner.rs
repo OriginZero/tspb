@@ -319,6 +319,11 @@ fn spawn_reader<R: Read + Send + 'static>(
             let mut text = String::from_utf8_lossy(&bytes)
                 .trim_end_matches('\r')
                 .to_string();
+            // Spring's colour codes reach us raw; ratatui drops the ESC byte and
+            // leaves "\u{1b}[34mINFO \u{1b}[0;39m" as the literal "[34mINFO [0;39m".
+            if text.contains('\u{1b}') {
+                text = strip_ansi(&text);
+            }
             if text.trim().is_empty() {
                 continue;
             }
@@ -365,4 +370,57 @@ fn kill_tree(pid: u32) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Drop ANSI escape sequences (CSI colours, OSC titles, two-byte escapes) so the
+/// pane, the clipboard and `--launch` output only ever carry plain text.
+/// Spring Boot writes `\x1b[34mINFO \x1b[0;39m` when started with
+/// `spring.output.ansi.enabled=always`; ratatui drops the ESC byte and would
+/// otherwise render the rest as a literal "[34m".
+pub(crate) fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            // CSI: ESC [ <params> <intermediates> <final 0x40..=0x7e>
+            Some('[') => {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC: ESC ] ... BEL or ESC backslash
+            Some(']') => {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                    if c == '\u{1b}' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            // Character-set designators carry one extra byte: ESC ( B, ESC ) 0
+            Some('(' | ')' | '*' | '+' | '#' | '%') => {
+                chars.next();
+                chars.next();
+            }
+            // Two-byte escapes: ESC 7, ESC =, ESC M ...
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
 }
