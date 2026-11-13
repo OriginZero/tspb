@@ -371,7 +371,7 @@ cargo clippy --all-targets
 cargo test
 ```
 
-提交 PR 前请保证这三条本地通过；CI 会在三个平台上再跑一遍。改动涉及键位或布局时，请一并更新 `README.md` 与 `README.zh-CN.md` 的键位表。
+提交 PR 前请保证这三条本地通过；CI 会在三个平台上再跑一遍。版本变更记录见 [`CHANGELOG.md`](./CHANGELOG.md)；改动涉及键位或布局时，请一并更新 `README.md` 与 `README.zh-CN.md` 的键位表。
 
 ## 许可证
 

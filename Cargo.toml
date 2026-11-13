@@ -1,6 +1,6 @@
 [package]
 name = "tspb"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Terminal UI launcher for Spring Boot: index JDKs, Maven and launchable modules, start with one key, watch logs in place."

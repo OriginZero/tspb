@@ -371,7 +371,7 @@ cargo clippy --all-targets
 cargo test
 ```
 
-Make these three pass locally before opening a PR; CI runs them again on all three platforms. If you change key bindings or layout, update the key tables in both `README.md` and `README.zh-CN.md`.
+Make these three pass locally before opening a PR; CI runs them again on all three platforms. Change history lives in [`CHANGELOG.md`](./CHANGELOG.md); key-binding or layout changes must update the tables in both `README.md` and `README.zh-CN.md`.
 
 ## License
 
