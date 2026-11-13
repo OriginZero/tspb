@@ -231,7 +231,7 @@ Once a window is active, the same `h/j/k/l` only act **inside that window**; the
 | --- | --- | --- |
 | ITEMS | `j/k` | Move the selection |
 | ITEMS | `h/l` | Previous / next workspace |
-| ITEMS | `Enter` | Launch, attach to a running app's log, or set the default JDK / Maven |
+| ITEMS | `Enter` | Launch, open the log of a running app, or set the default JDK / Maven |
 | WORKSPACES | `j/k/h/l` | Switch workspace (All / Running / Projects / toolchain views) |
 | LOG | `j/k` | Move the log line cursor |
 | LOG | `h/l` | Page up / page down |
@@ -245,7 +245,9 @@ Because buffers are bounded, a service you have not looked at for a long time ha
 
 ### LOG: copy, line selection, scrollbar
 
-The LOG pane opens in `SCROLL` mode; the scrollbar on the right shows where the line cursor sits in the whole log, and the reverse-video line is what `y` copies.
+The pane is in `FOLLOW` while it tails the live stream: every new line scrolls in and the cursor stays on the last line, so the status bar counter and `y` never point at a stale line. Entering the pane does not change that. Any manual move (`j`/`k`, `h`/`l`, `v`, `g`) freezes the view into `SCROLL` and **copying never scrolls it**: a yank keeps the cursor and the viewport exactly where they are, even while output keeps arriving. `G` / `End` / `F` go back to the tail and re-arm `FOLLOW`.
+
+The scrollbar on the right shows where the line cursor sits in the whole log, and the reverse-video line is what `y` copies.
 
 | Key | Action |
 | --- | --- |

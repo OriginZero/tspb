@@ -1064,12 +1064,16 @@ impl App {
         self.layer = Layer::Content;
         self.visual_anchor = None;
         if f == Focus::Log {
-            self.log_follow = false;
-            self.log_cursor = self.log_len().saturating_sub(1);
+            // Never re-enable follow just by entering the pane: a frozen view
+            // (after j/k or while yanking) must stay exactly where it is.
+            if self.log_follow {
+                self.log_cursor = self.log_len().saturating_sub(1);
+            }
             self.sync_log_view();
-            self.message =
-                "LOG · j/k line · h/l page · v select · y yank · Y all · g/G ends · Esc panes"
-                    .into();
+            self.message = format!(
+                "LOG · {} · j/k line · h/l page · v select · y yank · Y all · G tail",
+                if self.log_follow { "FOLLOW" } else { "SCROLL" }
+            );
         } else {
             self.message = format!(
                 "{} · j/k move · h/l workspace · Enter act · Esc panes",
@@ -1418,6 +1422,12 @@ impl App {
     pub fn tick(&mut self) {
         self.runner.poll();
         self.sync_log_target();
+        // While following the tail, every new line scrolls into view. An app
+        // that is logging hard must not leave the cursor stranded mid-buffer.
+        // Frozen views (j/k, v, y) keep their position: copying is not a scroll.
+        if self.log_follow {
+            self.sync_log_view();
+        }
         if self.last_proc_refresh.elapsed() >= Duration::from_secs(3) {
             self.refresh_processes();
             self.last_proc_refresh = Instant::now();

@@ -991,18 +991,27 @@ fn startup_progress_renders_stage_counters_and_clips_long_paths() {
 /// between, exercising `current_log_id()` the way two real services would.
 #[cfg(windows)]
 fn fake_service(dir: &str, tag: &str, jdk: &Jdk, runner: &mut Runner) -> (Project, String) {
+    let script = format!(
+        "@echo off\r\necho {tag}_READY\r\necho {tag}_SECOND\r\nping -n 30 127.0.0.1 >nul\r\n"
+    );
+    fake_service_script(dir, &script, jdk, runner)
+}
+
+/// Same shim, with a caller-supplied script — lets a test drip-feed lines
+/// ("echo, wait, echo") to observe scrolling while output is still arriving.
+#[cfg(windows)]
+fn fake_service_script(
+    dir: &str,
+    script: &str,
+    jdk: &Jdk,
+    runner: &mut Runner,
+) -> (Project, String) {
     use std::fs;
     let tmp = std::env::temp_dir().join(format!("tspb-svc-{}-{dir}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
     let bin = tmp.join("bin");
     fs::create_dir_all(&bin).unwrap();
-    fs::write(
-        bin.join("mvn.cmd"),
-        format!(
-            "@echo off\r\necho {tag}_READY\r\necho {tag}_SECOND\r\nping -n 30 127.0.0.1 >nul\r\n"
-        ),
-    )
-    .unwrap();
+    fs::write(bin.join("mvn.cmd"), script).unwrap();
     let mvn = Maven {
         name: format!("mvn-{dir}"),
         home: tmp.clone(),
@@ -1155,3 +1164,91 @@ fn selecting_another_running_row_switches_detail_and_log() {
     }
 }
 
+/// Two behaviours that pull in opposite directions: a live stream must keep the
+/// cursor on the tail, while a yank must not move the viewport at all.
+#[cfg(windows)]
+#[test]
+fn follow_tails_new_lines_but_copying_freezes_the_view() {
+    let jdk = Jdk {
+        name: "test-jdk".into(),
+        home: std::env::temp_dir(),
+        version: "17".into(),
+        java: PathBuf::from("java.exe"),
+        origin: Origin::Env,
+    };
+    let mut runner = Runner::new(200);
+    // TAIL_ONE immediately, TAIL_TWO after ~2s, then stay alive.
+    let script = "@echo off\r\necho TAIL_ONE\r\nping -n 3 127.0.0.1 >nul\r\necho TAIL_TWO\r\nping -n 30 127.0.0.1 >nul\r\n";
+    let (project, id) = fake_service_script("svc-tail", script, &jdk, &mut runner);
+    let tmp = project.path.clone();
+    wait_for_line(&mut runner, &id, "TAIL_ONE");
+
+    let mut app = test_app();
+    app.inv.projects = vec![project];
+    app.runner = runner;
+    app.rebuild_rows();
+    app.selected = app
+        .rows
+        .iter()
+        .position(|r| matches!(r.kind, RowKind::App { pid: Some(_), .. }))
+        .expect("a running row for the fake service");
+    app.tick();
+    assert_eq!(app.current_log_id().as_deref(), Some(id.as_str()));
+
+    // Opening the pane keeps following the tail and parks the cursor on it.
+    app.handle(Action::Vim('j'));
+    app.handle(Action::Enter);
+    assert!(app.is_log_content());
+    assert!(app.log_follow, "opening LOG keeps tailing");
+    assert_eq!(app.log_cursor, app.runner.log_len(&id).saturating_sub(1));
+
+    // Scroll up one line (freezes the view), then yank: nothing may move.
+    app.handle(Action::Vim('k'));
+    assert!(!app.log_follow);
+    let (cursor, scroll) = (app.log_cursor, app.log_scroll);
+    app.handle(Action::CopyLine);
+    assert_eq!(app.log_cursor, cursor, "yanking must not move the cursor");
+    assert_eq!(app.log_scroll, scroll, "yanking must not scroll the pane");
+    assert!(!app.log_follow, "yanking must not re-arm follow");
+
+    // A line arriving while frozen must not drag the viewport to the bottom.
+    let mut arrived = false;
+    for _ in 0..80 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        app.last_proc_refresh = std::time::Instant::now();
+        app.tick();
+        if app
+            .runner
+            .logs_for(&id)
+            .iter()
+            .any(|l| l.contains("TAIL_TWO"))
+        {
+            arrived = true;
+            break;
+        }
+    }
+    assert!(arrived, "the shim should emit TAIL_TWO");
+    assert_eq!(
+        app.log_cursor, cursor,
+        "new lines must not move a frozen view"
+    );
+    assert_eq!(app.log_scroll, scroll);
+
+    // End returns to the tail and re-arms follow.
+    app.handle(Action::End);
+    assert!(app.log_follow);
+    assert_eq!(app.log_cursor, app.runner.log_len(&id).saturating_sub(1));
+
+    // While following, every tick pulls the cursor back onto the last line, so
+    // a burst of output never leaves the status bar / `y` on a stale line.
+    app.log_cursor = 0;
+    app.tick();
+    assert_eq!(
+        app.log_cursor,
+        app.runner.log_len(&id).saturating_sub(1),
+        "follow mode keeps the cursor on the tail"
+    );
+
+    let _ = app.runner.stop(&id);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
