@@ -1193,7 +1193,14 @@ impl App {
             self.message = "no log stream to yank - launch an app first".into();
             return;
         };
-        let lines = self.runner.logs_for(&id);
+        // The buffer holds the raw stream; the clipboard gets what a terminal
+        // would have shown, without colour codes.
+        let lines: Vec<String> = self
+            .runner
+            .logs_for(&id)
+            .iter()
+            .map(|l| crate::runner::plain_text(l))
+            .collect();
         if lines.is_empty() {
             self.message = "log is empty".into();
             return;

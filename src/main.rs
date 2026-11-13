@@ -281,7 +281,8 @@ fn launch_cli(mut cfg: config::Config, args: &[String], pattern: &str) -> Result
             printed = 0; // ring buffer wrapped
         }
         for line in logs.iter().skip(printed) {
-            println!("{line}");
+            // Colour codes stay in the buffer for the TUI; stdout stays plain.
+            println!("{}", runner::plain_text(line));
         }
         printed = logs.len();
         let _ = std::io::stdout().flush();
@@ -323,14 +324,15 @@ fn launch_cli(mut cfg: config::Config, args: &[String], pattern: &str) -> Result
             "Error creating bean",
             "UnknownHostException",
         ];
-        let mut hints: Vec<String> = logs
+        let plain: Vec<String> = logs.iter().map(|l| runner::plain_text(l)).collect();
+        let mut hints: Vec<String> = plain
             .iter()
             .filter(|l| causes.iter().any(|k| l.contains(k)) && !l.trim_start().starts_with("at "))
             .cloned()
             .collect();
         if hints.is_empty() {
             // Fall back to Maven's own errors, skipping boilerplate help lines.
-            hints = logs
+            hints = plain
                 .iter()
                 .filter(|l| {
                     l.contains("ERROR")

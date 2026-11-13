@@ -460,6 +460,37 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, app: &App) {
     );
 }
 
+/// Parse one captured line into styled spans. The buffer keeps raw ANSI, so the
+/// app's own colours survive; when a line carries no styling at all (Maven,
+/// plain println) the pane's keyword rules colour it instead.
+pub(crate) fn log_spans(text: &str) -> Vec<Span<'static>> {
+    use ansi_to_tui::IntoText as _;
+    if let Ok(parsed) = text.as_bytes().into_text() {
+        let spans: Vec<Span<'static>> = parsed.lines.into_iter().flat_map(|l| l.spans).collect();
+        if spans.iter().any(|s| s.style != Style::default()) {
+            return spans;
+        }
+    }
+    vec![Span::styled(text.to_owned(), keyword_style(text))]
+}
+
+fn keyword_style(text: &str) -> Style {
+    let lower = text.to_lowercase();
+    let color =
+        if lower.contains("error") || lower.contains("exception") || lower.contains("failed") {
+            Color::Red
+        } else if lower.contains("warn") {
+            Color::Yellow
+        } else if lower.contains("started") || lower.contains("build success") {
+            Color::Green
+        } else if text.contains("$ ") {
+            Color::Cyan
+        } else {
+            Color::Reset
+        };
+    Style::default().fg(color)
+}
+
 fn render_log(f: &mut Frame<'_>, area: Rect, app: &App) {
     let active = is_active(app, Focus::Log);
     let height = area.height.saturating_sub(2) as usize;
@@ -483,35 +514,31 @@ fn render_log(f: &mut Frame<'_>, area: Rect, app: &App) {
         let selection = app.log_selection();
         for (offset, text) in raw.iter().skip(start).take(height).enumerate() {
             let abs = start + offset;
-            let lower = text.to_lowercase();
-            let color = if lower.contains("error")
-                || lower.contains("exception")
-                || lower.contains("failed")
-            {
-                Color::Red
-            } else if lower.contains("warn") {
-                Color::Yellow
-            } else if lower.contains("started") || lower.contains("build success") {
-                Color::Green
-            } else if text.contains("$ ") {
-                Color::Cyan
-            } else {
-                Color::Reset
-            };
-            let mut style = Style::default().fg(color);
+            // `ansi-to-tui` turns the app's own SGR codes into ratatui styles, so
+            // Spring's INFO/WARN/ERROR colours survive. Lines without codes fall
+            // back to the pane's keyword colouring.
+            let mut spans = log_spans(text);
+            let mut overlay = Style::default();
             if active && selection.is_some_and(|(a, b)| abs >= a && abs <= b) {
-                style = style.bg(Color::DarkGray).bold();
+                overlay = overlay.bg(Color::DarkGray).bold();
             }
             // The yank cursor is reversed so it is obvious which line `y` copies.
             if active && abs == app.log_cursor {
-                style = style.add_modifier(Modifier::REVERSED);
+                overlay = overlay.add_modifier(Modifier::REVERSED);
+            }
+            if overlay != Style::default() {
+                for span in &mut spans {
+                    span.style = span.style.patch(overlay);
+                }
             }
             let marker = if active && abs == app.log_cursor {
                 Span::styled("▸", Style::default().fg(PICKED))
             } else {
                 Span::raw(" ")
             };
-            lines.push(Line::from(vec![marker, Span::styled(text.clone(), style)]));
+            let mut line = vec![marker];
+            line.extend(spans);
+            lines.push(Line::from(line));
         }
     } else if let Some(row) = app.current_row() {
         if let RowKind::App { pid: Some(pid), .. } = row.kind {

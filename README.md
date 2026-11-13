@@ -247,7 +247,7 @@ Because buffers are bounded, a service you have not looked at for a long time ha
 
 The pane is in `FOLLOW` while it tails the live stream: every new line scrolls in and the cursor stays on the last line, so the status bar counter and `y` never point at a stale line. Entering the pane does not change that. Any manual move (`j`/`k`, `h`/`l`, `v`, `g`) freezes the view into `SCROLL` and **copying never scrolls it**: a yank keeps the cursor and the viewport exactly where they are, even while output keeps arriving. `G` / `End` / `F` go back to the tail and re-arm `FOLLOW`.
 
-Colour codes emitted by the app's own logger (`\x1b[34mINFO \x1b[0;39m`) are stripped before the line reaches the buffer, so the pane, the clipboard and `--launch` never show a literal `[34m`. Severity colouring comes from the pane's keyword rules instead (error / warn / started).
+The app's own colour codes (`\x1b[34mINFO \x1b[0;39m`) are parsed by [ansi-to-tui](https://crates.io/crates/ansi-to-tui) into real cell styles, so INFO / WARN / ERROR keep the colours your logger chose. Lines without codes (Maven, plain `println`) fall back to the pane's keyword rules. Anything that leaves the pane as text — the clipboard, `--launch` output — is flattened back to plain text, so escape parameters never show up as a literal `[34m`.
 
 The scrollbar on the right shows where the line cursor sits in the whole log, and the reverse-video line is what `y` copies.
 
@@ -358,7 +358,7 @@ src/
 │   └── process.rs    Running Spring Boot processes
 ├── clipboard.rs      System clipboard with temp-file fallback
 ├── update.rs         tspb update: GitHub release download, checksum, binary replace
-└── tests.rs          29 tests (real process start/log/stop, two-service log switching, ANSI stripping, Vim layers, log copy, rendering, cwd resolution, key de-duplication, startup progress)
+└── tests.rs          30 tests (real process start/log/stop, two-service log switching, ANSI styling, Vim layers, log copy, rendering, cwd resolution, key de-duplication, startup progress)
 ```
 
 ## Contributing

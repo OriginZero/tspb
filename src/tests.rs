@@ -1330,32 +1330,59 @@ fn follow_tails_new_lines_but_copying_freezes_the_view() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-/// Spring Boot colourises its own output; the pane must show the text, not the
-/// escape codes. Plain `[34m` text (already stripped, or literal in the log)
-/// must survive untouched.
+/// The buffer keeps the app's escape sequences; the pane turns SGR into styles.
+/// Spring Boot writes "\u{1b}[34mINFO \u{1b}[0;39m" when colour is forced on.
 #[test]
-fn ansi_escapes_are_removed_but_plain_brackets_survive() {
-    use crate::runner::strip_ansi;
+fn ansi_colours_become_spans_instead_of_literal_text() {
+    use ratatui::style::Color;
+
+    let spans = crate::ui::log_spans("\u{1b}[34mINFO \u{1b}[0;39m booted in 1.2 seconds");
+    let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(text, "INFO  booted in 1.2 seconds");
+    assert!(
+        !text.contains('['),
+        "escape parameters must never be rendered: {text:?}"
+    );
+    assert!(
+        spans.iter().any(|s| s.style.fg == Some(Color::Blue)),
+        "the app's own colour is kept: {spans:?}"
+    );
+
+    // Bold / reset round-trip, and a line without codes keeps keyword colouring.
+    let bold = crate::ui::log_spans("\u{1b}[1mBUILD SUCCESS\u{1b}[0m");
+    assert!(bold.iter().any(|s| {
+        s.style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD)
+    }));
+    let plain = crate::ui::log_spans("caused by: error opening socket");
+    assert_eq!(plain.len(), 1);
+    assert_eq!(plain[0].style.fg, Some(Color::Red));
+}
+
+/// Plain-text sinks (clipboard, --launch) must not carry escape codes at all.
+#[test]
+fn plain_text_flattens_sgr_and_drops_other_escapes() {
+    use crate::runner::plain_text;
 
     let nacos = "\u{1b}[34mINFO \u{1b}[0;39m \u{1b}[36mc.a.cloud.nacos.registry.NacosServiceRegistry:75\u{1b}[0;39m - nacos registry, DEFAULT_GROUP synergy-file 192.168.10.210:7010 register finished";
     assert_eq!(
-        strip_ansi(nacos),
+        plain_text(nacos),
         "INFO  c.a.cloud.nacos.registry.NacosServiceRegistry:75 - nacos registry, DEFAULT_GROUP synergy-file 192.168.10.210:7010 register finished"
     );
 
-    assert_eq!(strip_ansi("\u{1b}]0;tspb\u{7}titled"), "titled");
-    assert_eq!(strip_ansi("\u{1b}]0;tspb\u{1b}\\titled"), "titled");
-    assert_eq!(strip_ansi("\u{1b}7a\u{1b}(Bb"), "ab");
-    assert_eq!(strip_ansi("no escapes here"), "no escapes here");
-    assert_eq!(strip_ansi("list[0] = [34m"), "list[0] = [34m");
-    assert_eq!(strip_ansi("\u{1b}[2K\r"), "\r");
-    assert_eq!(strip_ansi("\u{1b}"), "");
+    assert_eq!(plain_text("\u{1b}]0;window title\u{7}payload"), "payload");
+    assert_eq!(plain_text("\u{1b}[2Kcleared"), "cleared");
+    assert_eq!(plain_text("\u{1b}"), "");
+    assert_eq!(plain_text("no escapes here"), "no escapes here");
+    // A literal "[34m" that was never an escape sequence is text, not a code.
+    assert_eq!(plain_text("list[0] = [34m"), "list[0] = [34m");
 }
 
-/// End to end through the real pipe: a shim that echoes colourised text.
+/// End to end: real pipe -> ring buffer -> rendered pane -> clipboard.
 #[cfg(windows)]
 #[test]
-fn colour_codes_never_reach_the_log_buffer() {
+fn colourised_output_renders_as_style_and_yanks_as_plain_text() {
     let jdk = Jdk {
         name: "test-jdk".into(),
         home: std::env::temp_dir(),
@@ -1365,26 +1392,52 @@ fn colour_codes_never_reach_the_log_buffer() {
     };
     let mut runner = Runner::new(100);
     let script =
-        "@echo off\r\necho \u{1b}[34mINFO \u{1b}[0;39m booted\r\nping -n 30 127.0.0.1 >nul\r\n";
+        "@echo off\r\necho \u{1b}[31mERROR \u{1b}[0;39m boom\r\nping -n 30 127.0.0.1 >nul\r\n";
     let (project, id) = fake_service_script("svc-ansi", script, &jdk, &mut runner);
     let tmp = project.path.clone();
-    wait_for_line(&mut runner, &id, "booted");
+    wait_for_line(&mut runner, &id, "boom");
 
-    let logs = runner.logs_for(&id);
-    let line = logs
+    let mut app = test_app();
+    app.inv.projects = vec![project];
+    app.runner = runner;
+    app.rebuild_rows();
+    app.selected = app
+        .rows
         .iter()
-        .find(|l| l.contains("booted"))
-        .expect("the colourised line is captured");
-    assert!(
-        !line.contains('\u{1b}'),
-        "escape bytes must not reach the buffer: {line:?}"
-    );
-    assert!(
-        !line.contains("[34m") && !line.contains("[0;39m"),
-        "leftover SGR params must not be rendered as text: {line:?}"
-    );
-    assert!(line.contains("INFO  booted"), "the text survives: {line:?}");
+        .position(|r| matches!(r.kind, RowKind::App { pid: Some(_), .. }))
+        .expect("a running row for the shim");
+    app.tick();
 
-    let _ = runner.stop(&id);
+    // The raw stream stays raw so the pane can style it.
+    let raw = app.runner.logs_for(&id);
+    assert!(
+        raw.iter().any(|l| l.contains('\u{1b}')),
+        "the buffer keeps the escape bytes: {raw:?}"
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(screen.contains("ERROR"), "the message is visible");
+    assert!(
+        !screen.contains("[31m") && !screen.contains("[0;39m"),
+        "the pane never shows escape parameters"
+    );
+
+    // Yanking the line drops the styling instead of copying it.
+    app.handle(Action::Vim('j'));
+    app.handle(Action::Enter);
+    app.handle(Action::CopyLine);
+    let yanked = app.clipboard.clone().expect("yanked to the clipboard");
+    assert!(!yanked.contains('\u{1b}'), "clipboard is plain: {yanked:?}");
+    assert!(yanked.contains("ERROR  boom"), "text survives: {yanked:?}");
+
+    let _ = app.runner.stop(&id);
     let _ = std::fs::remove_dir_all(&tmp);
 }

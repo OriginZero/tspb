@@ -316,21 +316,22 @@ fn spawn_reader<R: Read + Send + 'static>(
     std::thread::spawn(move || {
         for line in BufReader::new(reader).split(b'\n') {
             let Ok(bytes) = line else { break };
-            let mut text = String::from_utf8_lossy(&bytes)
+            // The buffer keeps the escape sequences: the pane turns SGR codes
+            // into styles (ansi-to-tui) and flattens them only where plain text
+            // is required, e.g. the clipboard or --launch diagnosis.
+            let raw = String::from_utf8_lossy(&bytes)
                 .trim_end_matches('\r')
                 .to_string();
-            // Spring's colour codes reach us raw; ratatui drops the ESC byte and
-            // leaves "\u{1b}[34mINFO \u{1b}[0;39m" as the literal "[34mINFO [0;39m".
-            if text.contains('\u{1b}') {
-                text = strip_ansi(&text);
-            }
-            if text.trim().is_empty() {
+            let plain = plain_text(&raw);
+            if plain.trim().is_empty() {
                 continue;
             }
-            if is_err && !text.starts_with('[') {
-                text = format!("! {text}");
-            }
-            let lower = text.to_lowercase();
+            let text = if is_err && !plain.starts_with('[') {
+                format!("! {raw}")
+            } else {
+                raw
+            };
+            let lower = plain.to_lowercase();
             if lower.contains("started ") && (lower.contains("seconds") || lower.contains(" in "))
                 || lower.contains("tomcat started on port")
                 || lower.contains("netty started")
@@ -372,55 +373,24 @@ fn kill_tree(pid: u32) -> Result<()> {
     Ok(())
 }
 
-/// Drop ANSI escape sequences (CSI colours, OSC titles, two-byte escapes) so the
-/// pane, the clipboard and `--launch` output only ever carry plain text.
-/// Spring Boot writes `\x1b[34mINFO \x1b[0;39m` when started with
-/// `spring.output.ansi.enabled=always`; ratatui drops the ESC byte and would
-/// otherwise render the rest as a literal "[34m".
-pub(crate) fn strip_ansi(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.peek().copied() {
-            // CSI: ESC [ <params> <intermediates> <final 0x40..=0x7e>
-            Some('[') => {
-                chars.next();
-                while let Some(c) = chars.next() {
-                    if ('\u{40}'..='\u{7e}').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            // OSC: ESC ] ... BEL or ESC backslash
-            Some(']') => {
-                chars.next();
-                while let Some(c) = chars.next() {
-                    if c == '\u{7}' {
-                        break;
-                    }
-                    if c == '\u{1b}' {
-                        if chars.peek() == Some(&'\\') {
-                            chars.next();
-                        }
-                        break;
-                    }
-                }
-            }
-            // Character-set designators carry one extra byte: ESC ( B, ESC ) 0
-            Some('(' | ')' | '*' | '+' | '#' | '%') => {
-                chars.next();
-                chars.next();
-            }
-            // Two-byte escapes: ESC 7, ESC =, ESC M ...
-            Some(_) => {
-                chars.next();
-            }
-            None => {}
-        }
+/// Flatten one log line to the text a terminal would have shown: SGR codes
+/// carry styling for the pane, every other escape sequence is dropped.
+/// Used wherever the raw buffer feeds a plain-text sink (clipboard, --launch
+/// diagnosis); rendering goes through `ansi-to-tui` instead.
+pub(crate) fn plain_text(line: &str) -> String {
+    // Fast path: Maven and plain println output never carry escape sequences.
+    if !line.contains('\u{1b}') {
+        return line.to_owned();
     }
-    out
+    use ansi_to_tui::IntoText as _;
+    match line.as_bytes().into_text() {
+        Ok(text) => text
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect(),
+        // Malformed input: better to show the raw line than to lose it.
+        Err(_) => line.to_owned(),
+    }
 }
