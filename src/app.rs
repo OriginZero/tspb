@@ -607,8 +607,9 @@ impl App {
         // ---- layer-aware navigation: the same key means different things in
         // PANES (pick a window) and CONTENT (move inside that window). --------
         match action {
-            // One key, no prefix: full-screen the pane you are already in.
-            Action::Vim('z') if self.layer == Layer::Content => return self.toggle_zoom(),
+            // One key, no prefix: full screen the window you are in (CONTENT) or
+            // the one you highlighted (PANES). Nothing targeted -> nothing to do.
+            Action::Vim('z') if self.hover.is_some() => return self.toggle_zoom(),
             Action::Vim(c) => return self.navigate(c),
             Action::Move(d) => return self.navigate_move(d),
             Action::Enter => {

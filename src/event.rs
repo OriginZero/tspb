@@ -171,6 +171,8 @@ fn translate_key(k: KeyEvent, prefix_active: bool, editing: bool, prefix_char: c
         KeyCode::Char('M') => Action::MavenPicker,
         KeyCode::Char('c') => Action::ConfigPicker,
         KeyCode::Char('v') => Action::Visual,
+        // Full screen the window under the cursor; App decides per layer.
+        KeyCode::Char('z') => Action::Vim('z'),
         KeyCode::Char('y') => Action::CopyLine,
         KeyCode::Char('Y') => Action::CopyAll,
         KeyCode::Char('F') => Action::End, // back to live tail

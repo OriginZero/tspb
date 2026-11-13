@@ -1511,6 +1511,31 @@ fn zoomed_rendering_hides_the_other_panes() {
     );
 }
 
+/// The key has to survive event translation first: it used to map to
+/// Action::None, so the handler below was unreachable from a real keypress.
+#[test]
+fn bare_z_reaches_the_app() {
+    assert_eq!(
+        event::translate(
+            key(KeyCode::Char('z'), KeyModifiers::NONE),
+            false,
+            false,
+            'b'
+        ),
+        Action::Vim('z')
+    );
+    assert_eq!(
+        event::translate(
+            key(KeyCode::Char('z'), KeyModifiers::NONE),
+            true,
+            false,
+            'b'
+        ),
+        Action::Zoom,
+        "the prefix form still works"
+    );
+}
+
 /// No prefix, no palette: `z` inside a window goes full screen and back.
 #[test]
 fn z_toggles_full_screen_inside_a_window() {
@@ -1535,13 +1560,18 @@ fn z_toggles_full_screen_inside_a_window() {
     assert_eq!(app.zoom, Some(Focus::List));
 }
 
+/// PANES starts with nothing targeted, but once a window is highlighted `z`
+/// must zoom it without requiring Enter first.
 #[test]
-fn bare_z_does_nothing_in_the_panes_layer() {
+fn bare_z_in_panes_zooms_the_highlighted_window() {
     let mut app = test_app();
     app.handle(Action::Vim('z'));
-    assert_eq!(
-        app.zoom, None,
-        "PANES keeps its 'nothing selected' rules; use Enter first"
-    );
+    assert_eq!(app.zoom, None, "nothing is targeted yet");
     assert_eq!(app.layer, Layer::Panes);
+
+    app.handle(Action::Vim('j')); // highlight LOG
+    assert_eq!(app.hover, Some(Focus::Log));
+    app.handle(Action::Vim('z'));
+    assert_eq!(app.zoom, Some(Focus::Log));
+    assert_eq!(app.layer, Layer::Panes, "zooming does not enter the pane");
 }

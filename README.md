@@ -220,6 +220,7 @@ The scan runs on a worker thread; the TUI is swapped in as soon as the inventory
 | `j` / `↓` | Select LOG below |
 | `k` / `↑` | Select ITEMS above |
 | `Enter` | Enter the selected window (ITEMS if nothing was picked yet) |
+| `z` | Full screen the selected window without entering it |
 | `Esc` | Clear filter / status filter / zoom / toast message |
 | `?` / `r` / `q` / `Q` | Help / rescan / detach / stop everything and quit |
 
@@ -359,7 +360,7 @@ src/
 │   └── process.rs    Running Spring Boot processes
 ├── clipboard.rs      System clipboard with temp-file fallback
 ├── update.rs         tspb update: GitHub release download, checksum, binary replace
-└── tests.rs          35 tests (real process start/log/stop, two-service log switching, ANSI styling, Vim layers, log copy, rendering, cwd resolution, key de-duplication, startup progress)
+└── tests.rs          36 tests (real process start/log/stop, two-service log switching, ANSI styling, Vim layers, log copy, rendering, cwd resolution, key de-duplication, startup progress)
 ```
 
 ## Contributing
