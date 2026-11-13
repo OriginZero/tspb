@@ -195,6 +195,16 @@ scan roots: <本次索引的仓库根目录>
 
 `--launch NAME --watch-seconds N` 可无界面启动单个模块并流式打印日志，到时或进程退出后自动清理进程树，适合复现和排障。
 
+### 启动进度
+
+扫描 IDEA 安装、机器上的多个 JDK / Maven 以及较深的多模块目录可能耗时几秒，因此界面会立即打开并显示进度页，而不是让终端看起来像卡住：
+
+- 四个阶段依次推进、完成即打勾：`idea → toolchains → projects → processes`；
+- 进度条 + 实时计数（JDK / Maven / 项目数 / 已遍历目录数）与当前正在遍历的目录；
+- 扫描期间按 `Esc`（或 `q` / `ctrl+c`）可直接退出，不会启动任何东西。
+
+扫描在工作线程中执行，inventory 就绪后立刻切到主界面。`--scan-only` / `--launch` 不显示进度页，仍同步扫描。
+
 ## 交互（Vim 两层模型）
 
 > 一次按键只产生一个动作：Windows 终端会为每次按键同时上报 key-down 与 key-up，增强终端还会在长按时上报 auto-repeat；这些伪事件在进入状态机前就被丢弃，因此 `j/k` 不会跳两格、`/` 过滤不会打重复字符、`Enter` 不会启动两个进程。松开 `ctrl+b` 也不会取消刚按下的 prefix。
@@ -327,6 +337,7 @@ src/
 ├── app.rs            状态机：视图/焦点/过滤/prefix/picker/确认框、JDK 版本匹配
 ├── event.rs          键位翻译（prefix 状态机 + 直接键 + 鼠标）
 ├── ui.rs             ratatui 渲染：sidebar / 列表 / 详情 / 日志 pane / overlay
+├── progress.rs       启动扫描进度：共享状态、分阶段进度条、启动页
 ├── runner.rs         进程启动、停止、日志采集、detach
 ├── config.rs         TOML 配置、cwd 仓库根定位、全局目录
 ├── model.rs          数据结构与状态枚举
@@ -337,7 +348,7 @@ src/
 │   └── process.rs    运行中的 Spring Boot 进程
 ├── clipboard.rs      系统剪贴板写入与无剪贴板时的临时文件降级
 ├── update.rs         tspb update：下载 GitHub release、校验哈希、替换自身
-└── tests.rs          20 项测试（含真实进程启动/日志/停止、Vim 层导航、日志复制、渲染、cwd 定位、按键去重）
+└── tests.rs          24 项测试（含真实进程启动/日志/停止、Vim 层导航、日志复制、渲染、cwd 定位、按键去重、启动进度页）
 ```
 
 ## 参与贡献

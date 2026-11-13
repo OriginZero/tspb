@@ -3,6 +3,7 @@ use super::{
 };
 use crate::config::Config;
 use crate::model::{Jdk, Maven, Origin};
+use crate::progress::Reporter;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::fs;
@@ -18,7 +19,8 @@ pub struct IdeaInfo {
     pub mavens: Vec<Maven>,
 }
 
-pub fn discover(cfg: &Config) -> IdeaInfo {
+pub fn discover(cfg: &Config, rep: &Reporter) -> IdeaInfo {
+    rep.detail("locating IDEA installations");
     let mut info = IdeaInfo {
         homes: find_installations(),
         config_dirs: find_config_dirs(),
@@ -46,6 +48,8 @@ pub fn discover(cfg: &Config) -> IdeaInfo {
                 info.mavens.push(m);
             }
         }
+        rep.jdks(info.jdks.len());
+        rep.mavens(info.mavens.len());
     }
 
     for dir in &info.config_dirs {
@@ -77,6 +81,8 @@ pub fn discover(cfg: &Config) -> IdeaInfo {
 
     info.jdks.sort_by(|a, b| a.name.cmp(&b.name));
     info.project_roots.dedup();
+    rep.jdks(info.jdks.len());
+    rep.mavens(info.mavens.len());
     info
 }
 

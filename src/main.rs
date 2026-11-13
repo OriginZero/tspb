@@ -3,6 +3,7 @@ mod clipboard;
 mod config;
 mod event;
 mod model;
+mod progress;
 mod runner;
 mod scan;
 mod ui;
@@ -22,6 +23,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io::{Stdout, Write};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
@@ -82,10 +85,30 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.hide_cursor()?;
 
-    let mut app = app::App::new(cfg)?;
+    // The scan is filesystem-bound; run it on a worker thread and keep drawing
+    // a gauge so large trees or many toolchains never look like a hang.
+    let inv = match scan_with_progress(&mut terminal, &cfg) {
+        Ok(Some(inv)) => inv,
+        Ok(None) => {
+            restore_terminal(&mut terminal)?;
+            println!("cancelled");
+            return Ok(());
+        }
+        Err(e) => {
+            restore_terminal(&mut terminal)?;
+            return Err(e);
+        }
+    };
+
+    let mut app = app::App::from_inventory(cfg, inv);
     let result = run_loop(&mut terminal, &mut app);
 
     // Always restore the terminal, even if the loop returned an error.
+    restore_terminal(&mut terminal)?;
+    result
+}
+
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -93,7 +116,61 @@ fn main() -> Result<()> {
         DisableMouseCapture
     )?;
     terminal.show_cursor()?;
-    result
+    Ok(())
+}
+
+/// Run `scan::collect` on a worker thread while rendering [`progress::render`].
+///
+/// Returns `Ok(None)` when the user aborts with Esc / q / ctrl+c before the
+/// scan finishes; the worker is then abandoned (the process exits right after).
+fn scan_with_progress(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    cfg: &config::Config,
+) -> Result<Option<model::Inventory>> {
+    let shared = Arc::new(Mutex::new(progress::ScanProgress::new()));
+    let (tx, rx) = mpsc::channel();
+    {
+        let cfg = cfg.clone();
+        let shared = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name("tspb-scan".into())
+            .spawn(move || {
+                let rep = progress::Reporter::new(shared);
+                let _ = tx.send(scan::collect_tracked(&cfg, &rep));
+            })?;
+    }
+
+    // Fast scans finish before the first frame: skip the splash entirely.
+    if let Ok(result) = rx.try_recv() {
+        return result.map(Some);
+    }
+
+    loop {
+        let snap = shared
+            .lock()
+            .map(|p| p.clone())
+            .unwrap_or_else(|_| progress::ScanProgress::new());
+        terminal.draw(|f| progress::render(f, &snap))?;
+
+        match rx.try_recv() {
+            Ok(result) => return result.map(Some),
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                bail!("scan worker stopped unexpectedly")
+            }
+        }
+
+        if poll(Duration::from_millis(60))?
+            && let crossterm::event::Event::Key(key) = read()?
+        {
+            use crossterm::event::{KeyCode, KeyModifiers};
+            let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c'));
+            if ctrl_c || matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                return Ok(None);
+            }
+        }
+    }
 }
 
 fn arg_value(args: &[String], flag: &str) -> Option<String> {

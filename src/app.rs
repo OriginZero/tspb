@@ -149,8 +149,9 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cfg: Config) -> Result<Self> {
-        let inv = scan::collect(&cfg)?;
+    /// Wrap an inventory that was collected elsewhere (e.g. by the startup
+    /// progress worker) in UI state, including the first status line.
+    pub fn from_inventory(cfg: Config, inv: Inventory) -> Self {
         let mut app = Self::with_inventory(cfg, inv);
         let dir = app
             .scan_root
@@ -165,7 +166,7 @@ impl App {
                 app.inv.projects.len()
             )
         };
-        Ok(app)
+        app
     }
 
     /// Build UI state from a pre-built inventory. Keeps the state machine and

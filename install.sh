@@ -5,7 +5,7 @@
 #
 # Environment variables:
 #   TSPB_INSTALL_DIR  where to put the binary (default: $HOME/.local/bin)
-#   TSPB_VERSION      release to install, e.g. v0.1.1 (default: latest)
+#   TSPB_VERSION      release to install, e.g. v0.2.0 (default: latest)
 #   TSPB_MIRROR       GitHub mirror prefix, e.g. https://ghfast.top/
 #
 # Without TSPB_MIRROR the direct download is tried first, then public GitHub

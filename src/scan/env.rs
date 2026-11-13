@@ -1,14 +1,26 @@
 use super::{exe, jdk_from_home, maven_from_home, push_unique_jdk, push_unique_maven};
 use crate::model::{Jdk, Maven, Origin};
+use crate::progress::Reporter;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Scan JDK / Maven from environment variables, PATH, and well-known install roots.
 /// Never spawns an external process: versions come from `release` and `maven-core-*.jar`.
-pub fn scan(jdks: &mut Vec<Jdk>, mavens: &mut Vec<Maven>) {
+pub fn scan(jdks: &mut Vec<Jdk>, mavens: &mut Vec<Maven>, rep: &Reporter) {
+    rep.detail("environment variables");
     scan_env_vars(jdks, mavens);
+    report(jdks, mavens, rep);
+    rep.detail("PATH");
     scan_path(jdks, mavens);
+    report(jdks, mavens, rep);
+    rep.detail("install roots");
     scan_install_roots(jdks, mavens);
+    report(jdks, mavens, rep);
+}
+
+fn report(jdks: &[Jdk], mavens: &[Maven], rep: &Reporter) {
+    rep.jdks(jdks.len());
+    rep.mavens(mavens.len());
 }
 
 fn scan_env_vars(jdks: &mut Vec<Jdk>, mavens: &mut Vec<Maven>) {

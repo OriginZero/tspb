@@ -5,29 +5,46 @@ pub mod project;
 
 use crate::config::Config;
 use crate::model::{Inventory, Jdk, Maven, Origin};
+use crate::progress::{Reporter, STAGE_ENV, STAGE_IDEA, STAGE_PROCESSES, STAGE_PROJECTS};
 use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 pub fn collect(cfg: &Config) -> Result<Inventory> {
+    collect_tracked(cfg, &Reporter::silent())
+}
+
+/// Same as [`collect`], but reports progress so the TUI can show a startup
+/// gauge while the (single-threaded) scan runs on a worker thread.
+pub fn collect_tracked(cfg: &Config, rep: &Reporter) -> Result<Inventory> {
     let mut inv = Inventory::default();
 
     // IDEA first: jdk.table.xml carries friendlier names than raw directory names.
-    let idea = idea::discover(cfg);
+    rep.stage(STAGE_IDEA);
+    let idea = idea::discover(cfg, rep);
     for j in idea.jdks {
         push_unique_jdk(&mut inv.jdks, j);
+        rep.jdks(inv.jdks.len());
     }
     for m in idea.mavens {
         push_unique_maven(&mut inv.mavens, m);
+        rep.mavens(inv.mavens.len());
     }
-    env::scan(&mut inv.jdks, &mut inv.mavens);
+
+    rep.stage(STAGE_ENV);
+    env::scan(&mut inv.jdks, &mut inv.mavens, rep);
+
+    rep.stage(STAGE_PROJECTS);
     let idea_roots = if cfg.strict_roots {
         &[][..]
     } else {
         &idea.project_roots[..]
     };
-    inv.projects = project::scan(cfg, idea_roots);
-    inv.running = process::scan();
+    inv.projects = project::scan(cfg, idea_roots, rep);
+
+    rep.stage(STAGE_PROCESSES);
+    inv.running = process::scan_tracked(rep);
+    rep.finish();
     Ok(inv)
 }
 

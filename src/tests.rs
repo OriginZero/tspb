@@ -2,11 +2,13 @@ use crate::app::{App, Focus, Layer, Mode, StatusFilter};
 use crate::config::Config;
 use crate::event::{self, Action};
 use crate::model::*;
+use crate::progress::{Reporter, STAGE_PROJECTS, ScanProgress};
 use crate::runner::Runner;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 fn key(code: KeyCode, mods: KeyModifiers) -> Event {
     Event::Key(KeyEvent::new(code, mods))
@@ -588,7 +590,7 @@ fn multi_module_idea_run_configuration_is_bound_to_its_module() {
         strict_roots: true,
         ..Default::default()
     };
-    let projects = crate::scan::project::scan(&cfg, &[]);
+    let projects = crate::scan::project::scan(&cfg, &[], &crate::progress::Reporter::silent());
     let p = projects
         .iter()
         .find(|p| p.name == "app-start")
@@ -700,10 +702,11 @@ fn launchable_filter_keeps_only_runnable_modules() {
         strict_roots: true,
         ..Default::default()
     };
-    let names: Vec<String> = crate::scan::project::scan(&cfg, &[])
-        .iter()
-        .map(|p| p.name.clone())
-        .collect();
+    let names: Vec<String> =
+        crate::scan::project::scan(&cfg, &[], &crate::progress::Reporter::silent())
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
     assert_eq!(
         names,
         vec!["app-start".to_string()],
@@ -714,7 +717,7 @@ fn launchable_filter_keeps_only_runnable_modules() {
         launchable_only: false,
         ..cfg.clone()
     };
-    let all = crate::scan::project::scan(&loose, &[]);
+    let all = crate::scan::project::scan(&loose, &[], &crate::progress::Reporter::silent());
     assert!(
         all.iter().any(|p| p.name == "core"),
         "--all-modules must expose library modules"
@@ -723,7 +726,7 @@ fn launchable_filter_keeps_only_runnable_modules() {
     // With no main class anywhere, fall back to every Spring module rather than
     // opening an empty picker.
     fs::remove_file(app.join("src/main/java/demo/DemoApplication.java")).unwrap();
-    let fallback = crate::scan::project::scan(&cfg, &[]);
+    let fallback = crate::scan::project::scan(&cfg, &[], &crate::progress::Reporter::silent());
     assert_eq!(fallback.len(), 2, "fallback must not be empty");
     let _ = fs::remove_dir_all(&tmp);
 }
@@ -911,4 +914,74 @@ fn log_window_yanks_line_range_and_whole_log() {
 
     let _ = app.runner.stop(&id);
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+fn tracked() -> (Arc<Mutex<ScanProgress>>, Reporter) {
+    let shared = Arc::new(Mutex::new(ScanProgress::new()));
+    let rep = Reporter::new(Arc::clone(&shared));
+    (shared, rep)
+}
+
+#[test]
+fn startup_progress_advances_with_stages_and_dirs() {
+    let (shared, rep) = tracked();
+    assert!(shared.lock().unwrap().ratio() < 0.1);
+
+    rep.stage(STAGE_PROJECTS);
+    rep.dirs(400);
+    rep.projects(3);
+    let ratio = shared.lock().unwrap().ratio();
+    // Two stages done plus half of the project walk.
+    assert!((0.6..0.7).contains(&ratio), "ratio after 400 dirs: {ratio}");
+
+    rep.dirs(4000);
+    assert!(shared.lock().unwrap().ratio() > ratio);
+
+    rep.finish();
+    assert_eq!(shared.lock().unwrap().ratio(), 1.0);
+
+    // The silent reporter used by --scan-only, rescans and tests is a no-op.
+    let silent = Reporter::silent();
+    silent.stage(STAGE_PROJECTS);
+    silent.dirs(1);
+    silent.projects(1);
+    silent.finish();
+}
+
+#[test]
+fn startup_progress_renders_stage_counters_and_clips_long_paths() {
+    let (shared, rep) = tracked();
+    rep.stage(STAGE_PROJECTS);
+    rep.dirs(1200);
+    rep.projects(7);
+    rep.jdks(3);
+    rep.mavens(2);
+    rep.detail(
+        "C:\\Users\\someone\\Desktop\\Project\\a-really-long-repository-path-that-needs-clipping",
+    );
+    let snap = shared.lock().unwrap().clone();
+
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+    terminal
+        .draw(|f| crate::progress::render(f, &snap))
+        .unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(text.contains("indexing workspace"));
+    assert!(text.contains("Indexing Spring Boot projects"));
+    assert!(text.contains("3 / 4"));
+    assert!(text.contains("projects 7"));
+    assert!(text.contains("dirs 1200"));
+    assert!(text.contains('…'), "long root paths are ellipsized");
+
+    // Both fallback layouts (too small for the box) must not panic either.
+    for (w, h) in [(30u16, 6u16), (20, 4), (10, 2)] {
+        let mut tiny = Terminal::new(TestBackend::new(w, h)).unwrap();
+        tiny.draw(|f| crate::progress::render(f, &snap)).unwrap();
+    }
 }

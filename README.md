@@ -195,6 +195,16 @@ scan roots: <repository root that was indexed>
 
 `--launch NAME --watch-seconds N` starts a single module headlessly, streams its log, and cleans up the process tree when the window ends or the app exits — handy for reproducing a failure.
 
+### Startup progress
+
+Scanning IDEA installs, many JDKs/Mavens and a deep multi-module tree can take a few seconds, so the UI opens immediately and shows a progress screen instead of a silently blocked terminal:
+
+- one stage per category, ticked off as the scan advances: `idea → toolchains → projects → processes`;
+- a gauge plus a live counter (JDKs / Maven / projects / directories visited) and the directory currently being walked;
+- `Esc` (or `q` / `ctrl+c`) aborts before anything is launched.
+
+The scan runs on a worker thread; the TUI is swapped in as soon as the inventory is ready. `--scan-only` / `--launch` skip the splash and scan synchronously.
+
 ## Interaction (two-layer Vim model)
 
 > One key press produces exactly one action: Windows terminals report both key-down and key-up for every press, and enhanced terminals add auto-repeat on long presses. Those phantom events are dropped before the state machine, so `j/k` never skips two rows, `/` filtering never doubles characters, and `Enter` never starts two processes. Releasing `ctrl+b` does not cancel the prefix you just pressed.
@@ -327,6 +337,7 @@ src/
 ├── app.rs            State machine: view/focus/filter/prefix/picker/confirm, JDK version matching
 ├── event.rs          Key translation (prefix state machine + direct keys + mouse)
 ├── ui.rs             ratatui rendering: sidebar / list / detail / log pane / overlays
+├── progress.rs       Startup scan progress: shared state, staged gauge, splash screen
 ├── runner.rs         Process start, stop, log capture, detach
 ├── config.rs         TOML config, cwd repository-root resolution, global roots
 ├── model.rs          Data structures and state enums
@@ -337,7 +348,7 @@ src/
 │   └── process.rs    Running Spring Boot processes
 ├── clipboard.rs      System clipboard with temp-file fallback
 ├── update.rs         tspb update: GitHub release download, checksum, binary replace
-└── tests.rs          20 tests (real process start/log/stop, Vim layers, log copy, rendering, cwd resolution, key de-duplication)
+└── tests.rs          24 tests (real process start/log/stop, Vim layers, log copy, rendering, cwd resolution, key de-duplication, startup progress)
 ```
 
 ## Contributing

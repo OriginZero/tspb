@@ -1,4 +1,5 @@
 use crate::model::{Origin, RunningApp};
+use crate::progress::Reporter;
 use crate::scan::env::home_from_java_exe;
 use std::path::PathBuf;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -20,6 +21,11 @@ const NON_APP_MARKERS: &[&str] = &[
 ];
 
 pub fn scan() -> Vec<RunningApp> {
+    scan_tracked(&Reporter::silent())
+}
+
+pub fn scan_tracked(rep: &Reporter) -> Vec<RunningApp> {
+    rep.detail("enumerating java processes");
     // refresh_processes() skips command lines; without cmd() every Java process
     // would be invisible. Request only cmd so the 3s UI refresh stays cheap.
     let mut sys = System::new();
@@ -78,6 +84,7 @@ pub fn scan() -> Vec<RunningApp> {
         });
     }
     out.sort_by_key(|a| a.name.to_lowercase());
+    rep.running(out.len());
     out
 }
 

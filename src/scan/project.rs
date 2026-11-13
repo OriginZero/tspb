@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::model::{BuildTool, LaunchConfig, Origin, Project};
+use crate::progress::Reporter;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::collections::HashSet;
@@ -61,7 +62,7 @@ fn is_aggregator_pom(path: &Path) -> bool {
     fs::read_to_string(path).is_ok_and(|s| s.contains("<modules>") || s.contains("<module>"))
 }
 
-pub fn scan(cfg: &Config, idea_roots: &[PathBuf]) -> Vec<Project> {
+pub fn scan(cfg: &Config, idea_roots: &[PathBuf], rep: &Reporter) -> Vec<Project> {
     let mut roots: Vec<PathBuf> = cfg.effective_roots();
     if !cfg.strict_roots {
         roots.extend(idea_roots.iter().cloned());
@@ -69,11 +70,14 @@ pub fn scan(cfg: &Config, idea_roots: &[PathBuf]) -> Vec<Project> {
     let mut seen = HashSet::new();
     // (Project, launchable) keeps the loose fallback available for unusual trees.
     let mut found: Vec<(Project, bool)> = Vec::new();
+    // Directories visited across all roots; drives the startup progress gauge.
+    let mut visited = 0usize;
 
     for root in roots {
         if !root.is_dir() || found.len() >= 400 {
             continue;
         }
+        rep.detail(root.display().to_string());
         // In a multi-module Maven project all IDEA run configurations live in the
         // repository root's .idea/, not in each module directory.
         let root_configs = root_run_configs(&root);
@@ -83,6 +87,11 @@ pub fn scan(cfg: &Config, idea_roots: &[PathBuf]) -> Vec<Project> {
             .into_iter()
             .filter_entry(|e| !is_skipped(e));
         for entry in walker.filter_map(Result::ok) {
+            visited += 1;
+            if visited.is_multiple_of(64) {
+                // Cheap progress signal: one lock bump per 64 entries.
+                rep.dirs(visited);
+            }
             if !entry.file_type().is_file() || found.len() >= 400 {
                 continue;
             }
@@ -150,8 +159,10 @@ pub fn scan(cfg: &Config, idea_roots: &[PathBuf]) -> Vec<Project> {
                 },
                 launchable,
             ));
+            rep.projects(found.len());
         }
     }
+    rep.dirs(visited);
 
     let mut out: Vec<Project> = if cfg.launchable_only {
         let strict: Vec<Project> = found
