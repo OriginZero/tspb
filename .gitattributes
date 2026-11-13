@@ -1,0 +1,16 @@
+# Normalize line endings so Windows and Unix contributors produce identical diffs.
+* text=auto eol=lf
+
+# Windows batch files must keep CRLF when they run.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets are never normalized.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.exe binary
+*.zip binary
+*.gz binary

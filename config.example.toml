@@ -1,0 +1,50 @@
+# tspb configuration example.
+# Copy to the path printed by `tspb --init-config`, or run that command
+# to generate a default file automatically.
+#
+# The default workflow needs NO config at all:
+#   cd /path/to/your-spring-repo && tspb
+# It indexes the toolchains, locates the repository enclosing the current
+# directory, keeps only launchable Spring Boot modules and opens the TUI.
+
+# Project scan roots. Empty = auto-detect the repository containing cwd.
+# Fill in explicit paths (or use --root) to index a fixed set of trees instead:
+# scan_roots = [
+#   "/path/to/repo-a",
+#   "/path/to/repo-b",
+# ]
+scan_roots = []
+
+# Max directory depth for project discovery. 6 covers nested multi-module repos.
+max_depth = 6
+
+# true = index only scan_roots / cwd, never IDEA's historical recent projects.
+# `--wide` flips this to false for global discovery.
+strict_roots = true
+
+# true = list only modules with their own @SpringBootApplication main class
+# (parent poms and api/biz libraries are hidden). `--all-modules` disables it.
+# If a tree has no main class at all, the tool falls back to all Spring modules.
+launchable_only = true
+
+# Prefix chord. Only ctrl+<char> is supported.
+prefix = "ctrl+b"
+
+# Preferred toolchain, matched case-insensitively as a substring of the name.
+# Leave commented out to auto-pick: a JDK whose major version matches the
+# project's <java.version> (inherited from parent poms), else JDK >= 17,
+# then IDEA-bundled Maven.
+# preferred_jdk = "temurin-17"
+# preferred_maven = "IDEA Maven"
+
+# Extra arguments appended to every launch.
+extra_args = []
+
+# Lines kept in the in-memory log ring buffer per managed process.
+log_capacity = 2000
+
+# Milliseconds between UI redraws / event polls.
+tick_ms = 250
+
+# Exclude the IDEA-bundled JetBrains Runtime (JBR) from the JDK list.
+skip_jbr = false

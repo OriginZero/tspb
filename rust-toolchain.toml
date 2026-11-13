@@ -1,0 +1,13 @@
+[toolchain]
+# Every platform builds with its own host toolchain of stable Rust (CI covers
+# Linux / macOS / Windows).
+#
+# Windows note: the GNU toolchain (stable-x86_64-pc-windows-gnu) on some machines
+# lacks dlltool.exe, which the windows-* crates need at link time, and linking
+# fails with unresolved symbols. Pin MSVC for your checkout locally instead of
+# committing a host-specific channel here (a committed channel breaks clones on
+# Linux/macOS):
+#   rustup override set stable-x86_64-pc-windows-msvc
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,1508 @@
+use crate::config::Config;
+use crate::event::{Action, parse_prefix};
+use crate::model::*;
+use crate::runner::Runner;
+use crate::scan;
+use anyhow::Result;
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    Sidebar,
+    List,
+    Log,
+}
+
+impl Focus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sidebar => "WORKSPACES",
+            Self::List => "ITEMS",
+            Self::Log => "LOG",
+        }
+    }
+}
+
+/// Vim-like two-layer input model.
+///
+/// * `Panes` (default): **no window is active**. h/j/k/l picks a window,
+///   Enter enters it. No pane border or list row is highlighted as focused.
+/// * `Content`: one window is active. h/j/k/l navigates *inside* that window,
+///   Enter acts on the current item, Esc returns to `Panes`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Layer {
+    #[default]
+    Panes,
+    Content,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Normal,
+    Filter,
+    Help,
+    Goto,
+    JdkPicker,
+    MavenPicker,
+    ConfigPicker,
+    ConfirmStop,
+    ConfirmQuit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusFilter {
+    Working,
+    Blocked,
+    Idle,
+    Done,
+}
+
+impl StatusFilter {
+    pub fn from_key(c: char) -> Option<Self> {
+        match c {
+            'w' => Some(Self::Working),
+            'b' => Some(Self::Blocked),
+            'i' => Some(Self::Idle),
+            'd' => Some(Self::Done),
+            _ => None,
+        }
+    }
+    pub fn matches(self, state: RunState) -> bool {
+        match self {
+            Self::Working => state == RunState::Starting,
+            Self::Blocked => state == RunState::Failed,
+            Self::Idle => matches!(state, RunState::Idle | RunState::Exited),
+            Self::Done => state == RunState::Running,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Working => "WORKING",
+            Self::Blocked => "BLOCKED",
+            Self::Idle => "IDLE",
+            Self::Done => "DONE",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Hitboxes {
+    pub sidebar: Rect,
+    pub list: Rect,
+    pub detail: Rect,
+    pub log: Rect,
+}
+
+pub struct LineEntry {
+    pub row: Option<usize>,
+    pub group: String,
+}
+
+pub struct App {
+    pub cfg: Config,
+    pub inv: Inventory,
+    pub runner: Runner,
+    pub view: View,
+    pub focus: Focus,
+    pub layer: Layer,
+    /// The window highlighted while in the PANES layer. `None` on startup:
+    /// literally nothing is selected until the first h/j/k/l.
+    pub hover: Option<Focus>,
+    pub mode: Mode,
+    pub prefix_active: bool,
+    pub prefix_char: char,
+    pub show_sidebar: bool,
+    pub show_log: bool,
+    pub zoom: Option<Focus>,
+    pub rows: Vec<Row>,
+    pub selected: usize,
+    pub sidebar_selected: usize,
+    pub picker_selected: usize,
+    pub filter: String,
+    pub goto_filter: String,
+    pub help_scroll: usize,
+    pub status_filter: Option<StatusFilter>,
+    pub active_jdk: usize,
+    pub active_maven: usize,
+    pub active_config: HashMap<String, usize>,
+    pub selected_log_id: Option<String>,
+    pub log_follow: bool,
+    pub log_scroll: usize,
+    /// Absolute index of the yank/scroll cursor inside the log ring buffer.
+    pub log_cursor: usize,
+    /// `v` anchors a visual line selection; `y` yanks anchor..cursor.
+    pub visual_anchor: Option<usize>,
+    /// Last yanked text (also the fallback when no OS clipboard is reachable).
+    pub clipboard: Option<String>,
+    /// Number of visible log lines, written by the renderer each frame.
+    pub log_view_height: usize,
+    pub message: String,
+    pub scan_root: std::path::PathBuf,
+    pub confirm_pid: Option<u32>,
+    pub quit_stop: bool,
+    pub should_quit: bool,
+    pub hitboxes: Hitboxes,
+    pub last_proc_refresh: Instant,
+}
+
+impl App {
+    pub fn new(cfg: Config) -> Result<Self> {
+        let inv = scan::collect(&cfg)?;
+        let mut app = Self::with_inventory(cfg, inv);
+        let dir = app
+            .scan_root
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| app.scan_root.to_string_lossy().into_owned());
+        app.message = if app.inv.projects.is_empty() {
+            format!("no Spring Boot app in {dir} - try --root DIR")
+        } else {
+            format!(
+                "{} items · PANES: h/j/k/l pick window, Enter enter, ? help",
+                app.inv.projects.len()
+            )
+        };
+        Ok(app)
+    }
+
+    /// Build UI state from a pre-built inventory. Keeps the state machine and
+    /// renderer testable without a real filesystem scan.
+    pub fn with_inventory(cfg: Config, inv: Inventory) -> Self {
+        let mut app = Self {
+            runner: Runner::new(cfg.log_capacity),
+            inv,
+            view: View::All,
+            focus: Focus::List,
+            layer: Layer::Panes,
+            hover: None,
+            mode: Mode::Normal,
+            prefix_active: false,
+            prefix_char: parse_prefix(&cfg.prefix),
+            show_sidebar: true,
+            show_log: true,
+            zoom: None,
+            rows: Vec::new(),
+            selected: 0,
+            sidebar_selected: 0,
+            picker_selected: 0,
+            filter: String::new(),
+            goto_filter: String::new(),
+            help_scroll: 0,
+            status_filter: None,
+            active_jdk: 0,
+            active_maven: 0,
+            active_config: HashMap::new(),
+            selected_log_id: None,
+            log_follow: true,
+            log_scroll: 0,
+            log_cursor: 0,
+            visual_anchor: None,
+            clipboard: None,
+            log_view_height: 10,
+            message: String::new(),
+            scan_root: cfg.effective_root(),
+            confirm_pid: None,
+            quit_stop: false,
+            should_quit: false,
+            hitboxes: Hitboxes::default(),
+            last_proc_refresh: Instant::now(),
+            cfg,
+        };
+        app.pick_default_tools();
+        app.rebuild_rows();
+        // Land on the first launchable item: the primary action is Enter -> start.
+        if let Some(i) = app.rows.iter().position(|r| r.group == "PROJECTS") {
+            app.selected = i;
+        }
+        app
+    }
+
+    pub fn is_editing(&self) -> bool {
+        matches!(self.mode, Mode::Filter | Mode::Goto)
+    }
+
+    fn pick_default_tools(&mut self) {
+        if let Some(pref) = self.cfg.preferred_jdk.as_ref() {
+            if let Some(i) = self
+                .inv
+                .jdks
+                .iter()
+                .position(|j| j.name.to_lowercase().contains(&pref.to_lowercase()))
+            {
+                self.active_jdk = i;
+            }
+        } else {
+            // Prefer a JDK matching the Java version declared by the scanned poms;
+            // an IDE-bundled JBR 25 must not silently run a Java 17 project.
+            let want = self
+                .inv
+                .projects
+                .iter()
+                .filter_map(|p| p.java_version)
+                .max();
+            self.active_jdk = want
+                .and_then(|w| {
+                    self.inv
+                        .jdks
+                        .iter()
+                        .position(|j| jdk_major(&j.version) == Some(w))
+                })
+                .or_else(|| {
+                    self.inv
+                        .jdks
+                        .iter()
+                        .position(|j| jdk_major(&j.version).is_some_and(|v| v >= 17))
+                })
+                .unwrap_or(0);
+        }
+        if let Some(pref) = self.cfg.preferred_maven.as_ref() {
+            if let Some(i) = self
+                .inv
+                .mavens
+                .iter()
+                .position(|m| m.name.to_lowercase().contains(&pref.to_lowercase()))
+            {
+                self.active_maven = i;
+            }
+        } else if let Some(i) = self
+            .inv
+            .mavens
+            .iter()
+            .position(|m| m.origin == Origin::Idea)
+        {
+            self.active_maven = i;
+        }
+    }
+
+    // ---------------------------------------------------------------- rows
+
+    fn match_project(&self, main_class: &str) -> Option<usize> {
+        let short = main_class.rsplit('.').next().unwrap_or(main_class);
+        self.inv.projects.iter().position(|p| {
+            p.main_class.as_deref() == Some(main_class)
+                || p.launch_configs.iter().any(|c| {
+                    c.main_class
+                        .as_deref()
+                        .is_some_and(|m| m == main_class || m.rsplit('.').next() == Some(short))
+                })
+        })
+    }
+
+    pub fn rebuild_rows(&mut self) {
+        let old_key = self.rows.get(self.selected).map(row_key);
+        let mut rows: Vec<Row> = Vec::new();
+        let view = self.view;
+        let show_running = matches!(view, View::All | View::Running);
+        let show_projects = matches!(view, View::All | View::Projects);
+        let tool_filter: Option<bool> = match view {
+            View::EnvTools => Some(false),
+            View::IdeaTools => Some(true),
+            _ => None,
+        };
+        let show_tools = self.status_filter.is_none()
+            && matches!(view, View::All | View::EnvTools | View::IdeaTools);
+
+        // Managed processes started by this TUI first (they are the freshest state).
+        if show_running {
+            for m in self.runner.managed.values() {
+                rows.push(Row {
+                    kind: RowKind::App {
+                        project: self
+                            .inv
+                            .projects
+                            .iter()
+                            .position(|p| p.path == m.project_path),
+                        pid: Some(m.pid),
+                    },
+                    group: "RUNNING".into(),
+                    label: m.label.clone(),
+                    origin: Origin::Idea,
+                    state: m.state,
+                    detail: format!("pid {} · started {} · managed", m.pid, m.started_at),
+                });
+            }
+            for a in &self.inv.running {
+                if self.runner.find_by_pid(a.pid).is_some() {
+                    continue;
+                }
+                let ports = if a.ports.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " · :{}",
+                        a.ports
+                            .iter()
+                            .map(u16::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                };
+                rows.push(Row {
+                    kind: RowKind::App {
+                        project: self.match_project(&a.main_class),
+                        pid: Some(a.pid),
+                    },
+                    group: "RUNNING".into(),
+                    label: a.name.clone(),
+                    origin: Origin::System,
+                    state: RunState::Running,
+                    detail: format!("pid {} · {}{}", a.pid, a.main_class, ports),
+                });
+            }
+        }
+
+        if show_projects {
+            for (i, p) in self.inv.projects.iter().enumerate() {
+                let managed = self.runner.find_by_project(&p.path);
+                let state = managed.map(|m| m.state).unwrap_or(RunState::Idle);
+                let cfg_name = self
+                    .config_of(i)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "spring-boot:run".into());
+                rows.push(Row {
+                    kind: RowKind::App {
+                        project: Some(i),
+                        pid: managed.map(|m| m.pid),
+                    },
+                    group: "PROJECTS".into(),
+                    label: p.name.clone(),
+                    origin: p.origin,
+                    state,
+                    detail: format!("{} · {} · {}", p.build.label(), cfg_name, p.path.display()),
+                });
+            }
+        }
+
+        if show_tools {
+            for (i, j) in self.inv.jdks.iter().enumerate() {
+                if tool_filter.is_some_and(|want_idea| (j.origin == Origin::Idea) != want_idea) {
+                    continue;
+                }
+                rows.push(Row {
+                    kind: RowKind::Jdk(i),
+                    group: "JDK".into(),
+                    label: format!("{} {}", j.name, j.version),
+                    origin: j.origin,
+                    state: RunState::Idle,
+                    detail: j.home.display().to_string(),
+                });
+            }
+            for (i, m) in self.inv.mavens.iter().enumerate() {
+                if tool_filter.is_some_and(|want_idea| (m.origin == Origin::Idea) != want_idea) {
+                    continue;
+                }
+                rows.push(Row {
+                    kind: RowKind::Maven(i),
+                    group: "MAVEN".into(),
+                    label: format!("{} {}", m.name, m.version),
+                    origin: m.origin,
+                    state: RunState::Idle,
+                    detail: m.home.display().to_string(),
+                });
+            }
+        }
+
+        let needle = self.filter.trim().to_lowercase();
+        rows.retain(|r| {
+            let status_ok = match r.kind {
+                RowKind::App { .. } => self
+                    .status_filter
+                    .map(|f| f.matches(r.state))
+                    .unwrap_or(true),
+                _ => self.status_filter.is_none(),
+            };
+            status_ok && (needle.is_empty() || r.search_text().to_lowercase().contains(&needle))
+        });
+        self.rows = rows;
+        self.selected = old_key
+            .and_then(|k| self.rows.iter().position(|r| row_key(r) == k))
+            .unwrap_or(self.selected)
+            .min(self.rows.len().saturating_sub(1));
+    }
+
+    pub fn lines(&self) -> Vec<LineEntry> {
+        let mut out = Vec::with_capacity(self.rows.len() + 4);
+        let mut last = String::new();
+        for (i, r) in self.rows.iter().enumerate() {
+            if r.group != last {
+                out.push(LineEntry {
+                    row: None,
+                    group: r.group.clone(),
+                });
+                last = r.group.clone();
+            }
+            out.push(LineEntry {
+                row: Some(i),
+                group: r.group.clone(),
+            });
+        }
+        out
+    }
+
+    pub fn selected_line(&self) -> Option<usize> {
+        self.lines()
+            .iter()
+            .position(|l| l.row == Some(self.selected))
+    }
+
+    pub fn current_row(&self) -> Option<&Row> {
+        self.rows.get(self.selected)
+    }
+
+    pub fn view_count(&self, view: View) -> usize {
+        match view {
+            View::All => {
+                self.inv.running.len()
+                    + self.inv.projects.len()
+                    + self.inv.jdks.len()
+                    + self.inv.mavens.len()
+            }
+            View::Running => self.inv.running.len(),
+            View::Projects => self.inv.projects.len(),
+            View::EnvTools => {
+                self.inv
+                    .jdks
+                    .iter()
+                    .filter(|j| j.origin != Origin::Idea)
+                    .count()
+                    + self
+                        .inv
+                        .mavens
+                        .iter()
+                        .filter(|m| m.origin != Origin::Idea)
+                        .count()
+            }
+            View::IdeaTools => {
+                self.inv
+                    .jdks
+                    .iter()
+                    .filter(|j| j.origin == Origin::Idea)
+                    .count()
+                    + self
+                        .inv
+                        .mavens
+                        .iter()
+                        .filter(|m| m.origin == Origin::Idea)
+                        .count()
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- toolchain helpers
+
+    pub fn jdk_label(&self) -> String {
+        self.inv
+            .jdks
+            .get(self.active_jdk)
+            .map(|j| format!("{} ({})", j.name, j.version))
+            .unwrap_or_else(|| "none".into())
+    }
+
+    pub fn maven_label(&self) -> String {
+        self.inv
+            .mavens
+            .get(self.active_maven)
+            .map(|m| format!("{} ({})", m.name, m.version))
+            .unwrap_or_else(|| "PATH mvn".into())
+    }
+
+    fn config_key(&self, pi: usize) -> String {
+        self.inv.projects[pi].path.display().to_string()
+    }
+
+    fn config_index(&self, pi: usize) -> usize {
+        let key = self.config_key(pi);
+        let len = self.inv.projects[pi].launch_configs.len().max(1);
+        self.active_config
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            .min(len - 1)
+    }
+
+    pub fn config_of(&self, pi: usize) -> Option<&LaunchConfig> {
+        self.inv
+            .projects
+            .get(pi)?
+            .launch_configs
+            .get(self.config_index(pi))
+    }
+
+    pub fn current_config_label(&self) -> String {
+        self.current_row()
+            .and_then(|r| match r.kind {
+                RowKind::App {
+                    project: Some(pi), ..
+                } => Some(pi),
+                _ => None,
+            })
+            .and_then(|pi| self.config_of(pi).map(|c| c.name.clone()))
+            .unwrap_or_else(|| "-".into())
+    }
+
+    pub fn current_log_id(&self) -> Option<String> {
+        if let Some(id) = &self.selected_log_id
+            && self.runner.managed.contains_key(id)
+        {
+            return Some(id.clone());
+        }
+        let row = self.current_row()?;
+        if let RowKind::App { project, pid } = row.kind {
+            if let Some(pid) = pid
+                && let Some(m) = self.runner.find_by_pid(pid)
+            {
+                return Some(m.id.clone());
+            }
+            if let Some(pi) = project {
+                let path = &self.inv.projects[pi].path;
+                return self.runner.find_by_project(path).map(|m| m.id.clone());
+            }
+        }
+        None
+    }
+
+    // ---------------------------------------------------------------- actions
+
+    pub fn handle(&mut self, action: Action) {
+        // Key-up / auto-repeat pseudo-events are not user input: dropping them
+        // here keeps one keystroke = one action and leaves a pending prefix intact.
+        if action == Action::Ignored {
+            return;
+        }
+        if action != Action::Prefix {
+            self.prefix_active = false;
+        }
+        // Overlays keep classic relative navigation: inside a picker / help /
+        // goto panel a Vim key simply means "move one line in that overlay".
+        let action = if self.mode != Mode::Normal {
+            match action {
+                Action::Vim('j') | Action::Vim('l') => Action::Move(1),
+                Action::Vim('k') | Action::Vim('h') => Action::Move(-1),
+                other => other,
+            }
+        } else {
+            action
+        };
+        match self.mode {
+            Mode::Normal => self.handle_normal(action),
+            Mode::Filter => self.handle_filter(action),
+            Mode::Goto => self.handle_goto(action),
+            Mode::Help => self.handle_help(action),
+            Mode::JdkPicker | Mode::MavenPicker | Mode::ConfigPicker => self.handle_picker(action),
+            Mode::ConfirmStop | Mode::ConfirmQuit => self.handle_confirm(action),
+        }
+    }
+
+    fn handle_normal(&mut self, action: Action) {
+        // ---- layer-aware navigation: the same key means different things in
+        // PANES (pick a window) and CONTENT (move inside that window). --------
+        match action {
+            Action::Vim(c) => return self.navigate(c),
+            Action::Move(d) => return self.navigate_move(d),
+            Action::Enter => {
+                if self.layer == Layer::Panes {
+                    self.enter_pane(self.hover.unwrap_or(Focus::List));
+                } else {
+                    self.primary_action();
+                }
+                return;
+            }
+            Action::Esc => return self.escape(),
+            Action::Focus(n) => {
+                let f = match n {
+                    0 => Focus::Sidebar,
+                    2 => Focus::Log,
+                    _ => Focus::List,
+                };
+                return self.enter_pane(f);
+            }
+            Action::CopyMode => {
+                self.enter_pane(Focus::Log);
+                self.message =
+                    "LOG: j/k scroll · v select · y yank · Y all · G tail · Esc panes".into();
+                return;
+            }
+            Action::Visual if self.is_log_content() => return self.toggle_visual(),
+            Action::CopyLine | Action::CopyAll if self.is_log_content() => {
+                return self.copy_log(action == Action::CopyAll);
+            }
+            Action::Goto | Action::Home if self.is_log_content() => {
+                return self.log_jump(0, false);
+            }
+            Action::End if self.is_log_content() => {
+                let last = self.log_len().saturating_sub(1);
+                return self.log_jump(last, true);
+            }
+            Action::PageDown | Action::PageUp if self.is_log_content() => {
+                return self.log_page(if action == Action::PageDown { 1 } else { -1 });
+            }
+            Action::PageDown | Action::PageUp => {
+                return self.navigate_move(if action == Action::PageDown { 10 } else { -10 });
+            }
+            Action::Home => {
+                self.selected = 0;
+                return;
+            }
+            Action::End => {
+                self.selected = self.rows.len().saturating_sub(1);
+                return;
+            }
+            _ => {}
+        }
+
+        // ---- global / item actions (available in either layer) --------------
+        match action {
+            // `handle` already returns early for Ignored; this arm only keeps
+            // the exhaustive match honest.
+            Action::None | Action::Ignored => {}
+            Action::Prefix => self.prefix_active = true,
+            Action::Quit(stop) => {
+                if stop && !self.runner.managed.is_empty() {
+                    self.quit_stop = true;
+                    self.mode = Mode::ConfirmQuit;
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            Action::Help => {
+                self.mode = Mode::Help;
+                self.help_scroll = 0;
+            }
+            Action::Goto => {
+                self.mode = Mode::Goto;
+                self.goto_filter.clear();
+                self.picker_selected = self.selected;
+            }
+            Action::FilterMode => {
+                self.mode = Mode::Filter;
+                self.filter.clear();
+            }
+            Action::Move(d) => self.move_selection(d),
+            Action::PageDown => self.move_selection(10),
+            Action::PageUp => self.move_selection(-10),
+            Action::Home => {
+                self.selected = 0;
+            }
+            Action::End => {
+                self.selected = self.rows.len().saturating_sub(1);
+            }
+            Action::Enter => self.primary_action(),
+            Action::Esc => {
+                self.filter.clear();
+                self.status_filter = None;
+                self.message.clear();
+                self.zoom = None;
+                self.rebuild_rows();
+            }
+            Action::FilterBackspace => {
+                if !self.filter.is_empty() {
+                    self.filter.pop();
+                    self.rebuild_rows();
+                }
+            }
+            Action::StatusFilter(c) => {
+                if c == 'a' {
+                    self.status_filter = None;
+                } else {
+                    let f = StatusFilter::from_key(c).unwrap();
+                    self.status_filter = if self.status_filter == Some(f) {
+                        None
+                    } else {
+                        Some(f)
+                    };
+                }
+                self.rebuild_rows();
+            }
+            Action::Stop => self.stop_selected(),
+            Action::Restart => self.restart_selected(),
+            Action::Refresh => self.refresh_all(),
+            Action::Focus(n) => self.set_focus(n),
+            Action::ToggleSidebar => {
+                self.show_sidebar = !self.show_sidebar;
+                if !self.show_sidebar && self.focus == Focus::Sidebar {
+                    self.reset_hidden_focus(Focus::List);
+                }
+            }
+            Action::ToggleLog => self.toggle_log_pane(),
+            Action::CloseLog => {
+                if self.show_log {
+                    self.toggle_log_pane();
+                }
+            }
+            Action::Zoom => {
+                self.zoom = if self.zoom.is_some() {
+                    None
+                } else {
+                    Some(self.focus)
+                };
+            }
+            Action::NextView => self.shift_view(1),
+            Action::PrevView => self.shift_view(-1),
+            Action::View(i) => {
+                if let Some(v) = View::ALL.get(i) {
+                    self.set_view(*v);
+                }
+            }
+            Action::JdkPicker => {
+                if self.inv.jdks.is_empty() {
+                    self.message = "no JDK found - press r to rescan".into();
+                } else {
+                    self.mode = Mode::JdkPicker;
+                    self.picker_selected = self.active_jdk;
+                }
+            }
+            Action::MavenPicker => {
+                if self.inv.mavens.is_empty() {
+                    self.message = "no Maven found - press r to rescan".into();
+                } else {
+                    self.mode = Mode::MavenPicker;
+                    self.picker_selected = self.active_maven;
+                }
+            }
+            Action::ConfigPicker => {
+                if self.current_config_count() > 1 {
+                    self.mode = Mode::ConfigPicker;
+                    self.picker_selected = self
+                        .current_row()
+                        .and_then(|r| match r.kind {
+                            RowKind::App {
+                                project: Some(pi), ..
+                            } => Some(self.config_index(pi)),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                } else {
+                    self.message = "only one launch configuration for this project".into();
+                }
+            }
+            Action::NextConfig => {
+                let n = self.current_config_count();
+                if n > 1
+                    && let Some(pi) = self.current_row().and_then(|r| match r.kind {
+                        RowKind::App {
+                            project: Some(i), ..
+                        } => Some(i),
+                        _ => None,
+                    })
+                {
+                    let next = (self.config_index(pi) + 1) % n;
+                    self.active_config.insert(self.config_key(pi), next);
+                    self.rebuild_rows();
+                    self.message = format!(
+                        "launch config: {}",
+                        self.config_of(pi)
+                            .map(|c| c.name.clone())
+                            .unwrap_or_default()
+                    );
+                }
+            }
+            Action::CopyMode => {
+                self.show_log = true;
+                self.focus = Focus::Log;
+                self.log_follow = false;
+                self.message = "log scroll mode - PgUp/PgDn, End to follow".into();
+            }
+            Action::Mouse(m) => self.handle_mouse(m),
+            Action::FilterChar(_) => {}
+            // The actions below were already handled by the layer-aware match
+            // above when relevant; these arms keep the match exhaustive and give
+            // `v` its old "toggle the log pane" meaning outside the LOG window.
+            Action::Vim(_) => {}
+            Action::Visual => self.toggle_log_pane(),
+            Action::CopyLine | Action::CopyAll => {
+                self.message = "yank needs the LOG window - pick LOG with j, then Enter".into();
+            }
+        }
+    }
+
+    fn handle_filter(&mut self, action: Action) {
+        match action {
+            Action::FilterChar(c) => {
+                self.filter.push(c);
+                self.rebuild_rows();
+            }
+            Action::FilterBackspace => {
+                self.filter.pop();
+                self.rebuild_rows();
+            }
+            Action::Enter | Action::Esc => {
+                if action == Action::Esc {
+                    self.filter.clear();
+                    self.rebuild_rows();
+                }
+                self.mode = Mode::Normal;
+            }
+            Action::Move(_) => {}
+            _ => {}
+        }
+    }
+
+    fn handle_goto(&mut self, action: Action) {
+        match action {
+            Action::FilterChar(c) => {
+                self.goto_filter.push(c);
+                self.picker_selected = 0;
+            }
+            Action::FilterBackspace => {
+                self.goto_filter.pop();
+            }
+            Action::Move(d) => {
+                let n = self.goto_items().len();
+                self.picker_selected = clamp_move(self.picker_selected, d, n);
+            }
+            Action::Enter => {
+                let items = self.goto_items();
+                if let Some((_, row_idx)) = items.get(self.picker_selected) {
+                    self.selected = *row_idx;
+                    self.enter_pane(Focus::List);
+                }
+                self.mode = Mode::Normal;
+            }
+            Action::Esc => self.mode = Mode::Normal,
+            _ => {}
+        }
+    }
+
+    pub fn goto_items(&self) -> Vec<(String, usize)> {
+        let needle = self.goto_filter.trim().to_lowercase();
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| needle.is_empty() || r.search_text().to_lowercase().contains(&needle))
+            .map(|(i, r)| (format!("[{}] {}", r.group, r.label), i))
+            .collect()
+    }
+
+    fn handle_help(&mut self, action: Action) {
+        match action {
+            Action::Move(d) => self.help_scroll = clamp_move(self.help_scroll, d, 40),
+            Action::PageDown => self.help_scroll = clamp_move(self.help_scroll, 10, 40),
+            Action::PageUp => self.help_scroll = clamp_move(self.help_scroll, -10, 40),
+            Action::Home => self.help_scroll = 0,
+            Action::Enter | Action::Esc | Action::Help => self.mode = Mode::Normal,
+            Action::Quit(_) => self.should_quit = true,
+            Action::FilterMode => self.mode = Mode::Normal,
+            _ => {}
+        }
+    }
+
+    fn handle_picker(&mut self, action: Action) {
+        let n = match self.mode {
+            Mode::JdkPicker => self.inv.jdks.len(),
+            Mode::MavenPicker => self.inv.mavens.len(),
+            Mode::ConfigPicker => self.current_config_count(),
+            _ => 0,
+        };
+        match action {
+            Action::Move(d) => self.picker_selected = clamp_move(self.picker_selected, d, n),
+            Action::Enter => {
+                match self.mode {
+                    Mode::JdkPicker => {
+                        self.active_jdk = self.picker_selected;
+                        self.message = format!("JDK -> {}", self.jdk_label());
+                    }
+                    Mode::MavenPicker => {
+                        self.active_maven = self.picker_selected;
+                        self.message = format!("Maven -> {}", self.maven_label());
+                    }
+                    Mode::ConfigPicker => {
+                        if let Some(pi) = self.current_row().and_then(|r| match r.kind {
+                            RowKind::App {
+                                project: Some(i), ..
+                            } => Some(i),
+                            _ => None,
+                        }) {
+                            self.active_config
+                                .insert(self.config_key(pi), self.picker_selected);
+                            self.message =
+                                format!("launch config -> {}", self.current_config_label());
+                            self.rebuild_rows();
+                        }
+                    }
+                    _ => {}
+                }
+                self.mode = Mode::Normal;
+            }
+            Action::Esc => self.mode = Mode::Normal,
+            _ => {}
+        }
+    }
+
+    fn handle_confirm(&mut self, action: Action) {
+        let confirm = matches!(action, Action::Enter);
+        let cancel = matches!(action, Action::Esc);
+        if !confirm && !cancel {
+            return;
+        }
+        let was_stop = self.mode == Mode::ConfirmStop;
+        self.mode = Mode::Normal;
+        if !confirm {
+            self.confirm_pid = None;
+            return;
+        }
+        if was_stop {
+            if let Some(pid) = self.confirm_pid.take() {
+                match Runner::stop_external(pid) {
+                    Ok(()) => {
+                        self.message = format!("sent stop to pid {pid}");
+                        self.refresh_processes();
+                    }
+                    Err(e) => self.message = format!("stop failed: {e}"),
+                }
+            }
+        } else {
+            for id in self.runner.managed.keys().cloned().collect::<Vec<_>>() {
+                let _ = self.runner.stop(&id);
+            }
+            self.should_quit = true;
+        }
+    }
+
+    // ---------------------------------------------------------------- vim layers
+
+    pub fn is_log_content(&self) -> bool {
+        self.layer == Layer::Content && self.focus == Focus::Log
+    }
+
+    fn navigate(&mut self, c: char) {
+        match self.layer {
+            Layer::Panes => self.navigate_panes(c),
+            Layer::Content => self.navigate_content(c),
+        }
+    }
+
+    /// In PANES nothing is active yet: h/j/k/l targets a window by geometry.
+    /// Sidebar is on the left, ITEMS on the top-right, LOG at the bottom-right.
+    fn navigate_panes(&mut self, c: char) {
+        let target = match c {
+            'h' => Focus::Sidebar,
+            'j' => Focus::Log,
+            // `l` leaves the sidebar for the items; `k` climbs back up from LOG.
+            'l' | 'k' => Focus::List,
+            _ => self.hover.unwrap_or(Focus::List),
+        };
+        let target = match target {
+            Focus::Sidebar if !self.show_sidebar => Focus::List,
+            Focus::Log if !self.show_log => Focus::List,
+            other => other,
+        };
+        self.hover = Some(target);
+        self.focus = target;
+        self.message = format!("{} selected · Enter enter · ? help", target.label());
+    }
+
+    fn navigate_content(&mut self, c: char) {
+        match self.focus {
+            Focus::List => match c {
+                'j' => self.move_selection(1),
+                'k' => self.move_selection(-1),
+                'h' => self.shift_view(-1),
+                'l' => self.shift_view(1),
+                _ => {}
+            },
+            Focus::Sidebar => match c {
+                'j' | 'l' => self.shift_view(1),
+                'k' | 'h' => self.shift_view(-1),
+                _ => {}
+            },
+            Focus::Log => match c {
+                'j' => self.log_step(1),
+                'k' => self.log_step(-1),
+                'h' => self.log_page(-1),
+                'l' => self.log_page(1),
+                _ => {}
+            },
+        }
+    }
+
+    fn navigate_move(&mut self, d: i32) {
+        match self.layer {
+            Layer::Panes => self.navigate_panes(if d > 0 { 'j' } else { 'k' }),
+            Layer::Content => self.move_selection(d),
+        }
+    }
+
+    /// Hiding the window that owns the cursor must not leave CONTENT pointing
+    /// at an invisible pane: drop back to PANES with nothing selected.
+    fn reset_hidden_focus(&mut self, fallback: Focus) {
+        self.focus = fallback;
+        self.layer = Layer::Panes;
+        self.hover = None;
+        self.visual_anchor = None;
+        self.zoom = None;
+    }
+
+    fn toggle_log_pane(&mut self) {
+        self.show_log = !self.show_log;
+        if !self.show_log {
+            if self.focus == Focus::Log {
+                self.reset_hidden_focus(Focus::List);
+            } else {
+                self.zoom = None;
+            }
+        }
+    }
+
+    fn enter_pane(&mut self, f: Focus) {
+        match f {
+            Focus::Sidebar => self.show_sidebar = true,
+            Focus::Log => self.show_log = true,
+            Focus::List => {}
+        }
+        self.focus = f;
+        self.hover = Some(f);
+        self.layer = Layer::Content;
+        self.visual_anchor = None;
+        if f == Focus::Log {
+            self.log_follow = false;
+            self.log_cursor = self.log_len().saturating_sub(1);
+            self.sync_log_view();
+            self.message =
+                "LOG · j/k line · h/l page · v select · y yank · Y all · g/G ends · Esc panes"
+                    .into();
+        } else {
+            self.message = format!(
+                "{} · j/k move · h/l workspace · Enter act · Esc panes",
+                f.label()
+            );
+        }
+    }
+
+    fn escape(&mut self) {
+        if self.visual_anchor.is_some() {
+            self.visual_anchor = None;
+            self.message = "visual selection cancelled".into();
+            return;
+        }
+        if self.layer == Layer::Content {
+            self.layer = Layer::Panes;
+            self.hover = Some(self.focus);
+            self.message =
+                "PANES · h/j/k/l pick a window · Enter enter · Esc clears filters".into();
+            return;
+        }
+        self.filter.clear();
+        self.status_filter = None;
+        self.message.clear();
+        self.zoom = None;
+        self.rebuild_rows();
+    }
+
+    // ---------------------------------------------------------------- log cursor
+
+    fn log_len(&self) -> usize {
+        self.current_log_id()
+            .map(|id| self.runner.log_len(&id))
+            .unwrap_or(0)
+    }
+
+    fn log_jump(&mut self, line: usize, follow: bool) {
+        self.log_follow = follow;
+        self.log_cursor = line.min(self.log_len().saturating_sub(1));
+        self.sync_log_view();
+    }
+
+    fn log_step(&mut self, d: i32) {
+        let total = self.log_len();
+        if total == 0 {
+            self.message = "no log lines yet - start an app first".into();
+            return;
+        }
+        self.log_follow = false;
+        let cur = self.log_cursor.min(total - 1) as i64;
+        self.log_cursor = (cur + d as i64).clamp(0, total as i64 - 1) as usize;
+        self.sync_log_view();
+    }
+
+    fn log_page(&mut self, d: i32) {
+        let step = self.log_view_height.max(1) as i32;
+        self.log_step(d * step);
+    }
+
+    /// Keep the yank cursor inside the visible window (unless following the tail).
+    fn sync_log_view(&mut self) {
+        let total = self.log_len();
+        let height = self.log_view_height.max(1);
+        if total == 0 {
+            self.log_scroll = 0;
+            self.log_cursor = 0;
+            return;
+        }
+        if self.log_follow {
+            self.log_scroll = total.saturating_sub(height);
+            self.log_cursor = total - 1;
+            return;
+        }
+        self.log_cursor = self.log_cursor.min(total - 1);
+        if self.log_cursor < self.log_scroll {
+            self.log_scroll = self.log_cursor;
+        } else if self.log_cursor >= self.log_scroll.saturating_add(height) {
+            self.log_scroll = self.log_cursor + 1 - height;
+        }
+        self.log_scroll = self.log_scroll.min(total.saturating_sub(height));
+    }
+
+    fn toggle_visual(&mut self) {
+        if self.visual_anchor.take().is_some() {
+            self.message = "VISUAL off".into();
+        } else {
+            self.log_follow = false;
+            self.visual_anchor = Some(self.log_cursor);
+            self.message = "VISUAL · j/k extend · y yank · Esc cancel".into();
+        }
+    }
+
+    pub fn log_selection(&self) -> Option<(usize, usize)> {
+        self.visual_anchor
+            .map(|a| (a.min(self.log_cursor), a.max(self.log_cursor)))
+    }
+
+    /// Pure range calculation: `Y` yanks everything, `v` yanks anchor..cursor,
+    /// plain `y` yanks the cursor line. Kept separate so it is unit-testable.
+    pub fn yank_text(&self, lines: &[String], all: bool) -> String {
+        if lines.is_empty() {
+            return String::new();
+        }
+        let last = lines.len() - 1;
+        let (start, end) = if all {
+            (0, last)
+        } else if let Some((a, b)) = self.log_selection() {
+            (a.min(last), b.min(last))
+        } else {
+            (self.log_cursor.min(last), self.log_cursor.min(last))
+        };
+        lines[start..=end].join("\n")
+    }
+
+    fn copy_log(&mut self, all: bool) {
+        let Some(id) = self.current_log_id() else {
+            self.message = "no log stream to yank - launch an app first".into();
+            return;
+        };
+        let lines = self.runner.logs_for(&id);
+        if lines.is_empty() {
+            self.message = "log is empty".into();
+            return;
+        }
+        let text = self.yank_text(&lines, all);
+        let count = text.lines().count().max(1);
+        self.clipboard = Some(text.clone());
+        self.visual_anchor = None;
+        self.message = match crate::clipboard::set_text(&text) {
+            Ok(()) => format!("yanked {count} line(s) to the system clipboard"),
+            Err(e) => match crate::clipboard::fallback_file(&text) {
+                Ok(path) => format!("clipboard unavailable ({e}) - saved to {}", path.display()),
+                Err(_) => format!("clipboard unavailable: {e}"),
+            },
+        };
+    }
+
+    fn current_config_count(&self) -> usize {
+        self.current_row()
+            .and_then(|r| match r.kind {
+                RowKind::App {
+                    project: Some(pi), ..
+                } => Some(pi),
+                _ => None,
+            })
+            .map(|pi| self.inv.projects[pi].launch_configs.len())
+            .unwrap_or(0)
+    }
+
+    /// Legacy prefix focus shortcut: in the Vim model this enters the window.
+    fn set_focus(&mut self, n: u8) {
+        let f = match n {
+            0 => Focus::Sidebar,
+            2 => Focus::Log,
+            _ => Focus::List,
+        };
+        self.enter_pane(f);
+    }
+
+    fn move_selection(&mut self, d: i32) {
+        match self.focus {
+            Focus::Sidebar => {
+                let n = View::ALL.len();
+                self.sidebar_selected = clamp_move(self.sidebar_selected, d, n);
+                if let Some(v) = View::ALL.get(self.sidebar_selected) {
+                    self.set_view(*v);
+                }
+            }
+            Focus::List => {
+                self.selected = clamp_move(self.selected, d, self.rows.len());
+            }
+            Focus::Log => self.log_step(d),
+        }
+    }
+
+    fn shift_view(&mut self, d: i32) {
+        let cur = View::ALL.iter().position(|v| *v == self.view).unwrap_or(0) as i32;
+        let n = View::ALL.len() as i32;
+        let next = (cur + d).rem_euclid(n) as usize;
+        self.set_view(View::ALL[next]);
+    }
+
+    fn set_view(&mut self, v: View) {
+        self.view = v;
+        self.sidebar_selected = View::ALL.iter().position(|x| *x == v).unwrap_or(0);
+        self.selected = 0;
+        self.rebuild_rows();
+    }
+
+    fn primary_action(&mut self) {
+        let Some(row) = self.current_row().cloned() else {
+            return;
+        };
+        match row.kind {
+            RowKind::Jdk(i) => {
+                self.active_jdk = i;
+                self.message = format!("JDK -> {}", self.jdk_label());
+            }
+            RowKind::Maven(i) => {
+                self.active_maven = i;
+                self.message = format!("Maven -> {}", self.maven_label());
+            }
+            RowKind::App { project, pid } => {
+                if pid.is_some() || matches!(row.state, RunState::Running | RunState::Starting) {
+                    self.selected_log_id = self.current_log_id();
+                    self.enter_pane(Focus::Log);
+                    self.log_follow = true;
+                    self.sync_log_view();
+                    self.message = "attached to live log · j/k scroll · y yank".into();
+                    return;
+                }
+                match project {
+                    Some(pi) => {
+                        let _ = self.launch_project(pi);
+                    }
+                    None => self.message = "no project associated with this process".into(),
+                }
+            }
+        }
+    }
+
+    pub fn launch_project(&mut self, pi: usize) -> Result<String> {
+        if self.inv.jdks.is_empty() {
+            anyhow::bail!("no JDK discovered - press r to rescan or set preferred_jdk in config");
+        }
+        let project = self.inv.projects[pi].clone();
+        let Some(cfg) = self.config_of(pi).cloned() else {
+            anyhow::bail!("no launch configuration for {}", project.name);
+        };
+        // An explicit preferred_jdk wins; otherwise honour this module's own
+        // <java.version> even if the global default points at another JDK.
+        let jdk = if self.cfg.preferred_jdk.is_some() {
+            self.inv.jdks[self.active_jdk].clone()
+        } else {
+            self.inv
+                .jdks
+                .iter()
+                .find(|j| {
+                    project
+                        .java_version
+                        .is_some_and(|w| jdk_major(&j.version) == Some(w))
+                })
+                .cloned()
+                .unwrap_or_else(|| self.inv.jdks[self.active_jdk].clone())
+        };
+        let maven = self.inv.mavens.get(self.active_maven).cloned();
+        match self
+            .runner
+            .launch(&project, &cfg, &jdk, maven.as_ref(), &self.cfg)
+        {
+            Ok(id) => {
+                self.selected_log_id = Some(id.clone());
+                self.enter_pane(Focus::Log);
+                self.log_follow = true;
+                self.sync_log_view();
+                self.message = format!(
+                    "launched {} with {} · log is live",
+                    project.name,
+                    self.jdk_label()
+                );
+                self.refresh_processes();
+                Ok(id)
+            }
+            Err(e) => {
+                self.message = format!("launch failed: {e:#}");
+                Err(e)
+            }
+        }
+    }
+
+    fn stop_selected(&mut self) {
+        let Some(row) = self.current_row().cloned() else {
+            return;
+        };
+        let RowKind::App { pid, .. } = row.kind else {
+            self.message = "select an application first".into();
+            return;
+        };
+        let Some(pid) = pid else {
+            self.message = "not running".into();
+            return;
+        };
+        if let Some(m) = self.runner.find_by_pid(pid) {
+            let id = m.id.clone();
+            match self.runner.stop(&id) {
+                Ok(()) => {
+                    self.selected_log_id = None;
+                    self.message = format!("stopped {id}");
+                    self.refresh_processes();
+                }
+                Err(e) => self.message = format!("stop failed: {e}"),
+            }
+        } else {
+            self.confirm_pid = Some(pid);
+            self.mode = Mode::ConfirmStop;
+        }
+    }
+
+    fn restart_selected(&mut self) {
+        let Some(row) = self.current_row().cloned() else {
+            return;
+        };
+        let RowKind::App {
+            project: Some(pi),
+            pid,
+            ..
+        } = row.kind
+        else {
+            self.message = "no project to restart".into();
+            return;
+        };
+        if let Some(pid) = pid {
+            if let Some(m) = self.runner.find_by_pid(pid) {
+                let id = m.id.clone();
+                let _ = self.runner.stop(&id);
+            } else {
+                self.message = "externally started process - stop it first (s)".into();
+                return;
+            }
+        }
+        if let Err(e) = self.launch_project(pi) {
+            self.message = format!("restart failed: {e:#}");
+        }
+    }
+
+    fn refresh_all(&mut self) {
+        match scan::collect(&self.cfg) {
+            Ok(inv) => {
+                self.inv = inv;
+                self.active_jdk = self.active_jdk.min(self.inv.jdks.len().saturating_sub(1));
+                self.active_maven = self
+                    .active_maven
+                    .min(self.inv.mavens.len().saturating_sub(1));
+                self.rebuild_rows();
+                self.message = format!("rescanned: {}", self.inv.summary());
+            }
+            Err(e) => self.message = format!("rescan failed: {e}"),
+        }
+    }
+
+    fn refresh_processes(&mut self) {
+        self.inv.running = scan::process::scan();
+        self.rebuild_rows();
+    }
+
+    pub fn tick(&mut self) {
+        self.runner.poll();
+        if self.last_proc_refresh.elapsed() >= Duration::from_secs(3) {
+            self.refresh_processes();
+            self.last_proc_refresh = Instant::now();
+        }
+    }
+
+    fn handle_mouse(&mut self, m: MouseEvent) {
+        let (x, y) = (m.column, m.row);
+        match m.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let d = if m.kind == MouseEventKind::ScrollUp {
+                    -1
+                } else {
+                    1
+                };
+                // Mouse always acts on the pane under the pointer and enters it.
+                if in_rect(self.hitboxes.log, x, y) {
+                    if !self.is_log_content() {
+                        self.enter_pane(Focus::Log);
+                    }
+                    self.log_step(d);
+                } else if in_rect(self.hitboxes.list, x, y) {
+                    if self.layer == Layer::Panes
+                        || (self.layer == Layer::Content && self.focus != Focus::List)
+                    {
+                        self.enter_pane(Focus::List);
+                    }
+                    self.move_selection(d);
+                } else if in_rect(self.hitboxes.sidebar, x, y) {
+                    if self.layer == Layer::Panes
+                        || (self.layer == Layer::Content && self.focus != Focus::Sidebar)
+                    {
+                        self.enter_pane(Focus::Sidebar);
+                    }
+                    self.move_selection(d);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if in_rect(self.hitboxes.sidebar, x, y) {
+                    let idx = y.saturating_sub(self.hitboxes.sidebar.y + 1) as usize;
+                    if let Some(v) = View::ALL.get(idx) {
+                        self.set_view(*v);
+                    }
+                    self.enter_pane(Focus::Sidebar);
+                } else if in_rect(self.hitboxes.list, x, y) {
+                    let idx = y.saturating_sub(self.hitboxes.list.y + 1) as usize;
+                    if let Some(entry) = self.lines().get(idx)
+                        && let Some(r) = entry.row
+                    {
+                        self.selected = r;
+                    }
+                    self.enter_pane(Focus::List);
+                } else if in_rect(self.hitboxes.log, x, y) {
+                    self.enter_pane(Focus::Log);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn jdk_major(version: &str) -> Option<u32> {
+    let mut parts = version.trim_matches('"').split('.');
+    let mut major: u32 = parts.next()?.parse().ok()?;
+    if major == 1 {
+        // Legacy "1.8.0_302" style version strings.
+        let minor: String = parts
+            .next()?
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        major = minor.parse().ok()?;
+    }
+    Some(major)
+}
+
+fn row_key(r: &Row) -> String {
+    format!("{}::{}", r.group, r.label)
+}
+
+fn clamp_move(cur: usize, d: i32, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let n = len as i64;
+    ((cur as i64 + d as i64).clamp(0, n - 1)) as usize
+}
+
+fn in_rect(r: Rect, x: u16, y: u16) -> bool {
+    r.width > 0
+        && r.height > 0
+        && x >= r.x
+        && x < r.x.saturating_add(r.width)
+        && y >= r.y
+        && y < r.y.saturating_add(r.height)
+}
