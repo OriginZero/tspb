@@ -49,11 +49,21 @@ When you need to edit code, set breakpoints or refactor, go back to your IDE.
 
 ## Quick start
 
-Download the binary for your platform from GitHub Releases and put it on your `PATH`, or install from source (Rust 1.85+):
+Download the binary for your platform from [Releases](https://github.com/OriginZero/tspb/releases) and put it on your `PATH`, or install from source (Rust 1.85+):
 
 ```bash
 cargo install --path .
 ```
+
+Every tag ships prebuilt binaries named `tspb-<tag>-<target>`:
+
+| Platform | Target triple |
+| --- | --- |
+| Windows x86_64 | `x86_64-pc-windows-msvc` (`.zip`) |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` (`.tar.gz`) |
+| Linux arm64 | `aarch64-unknown-linux-gnu` (`.tar.gz`) |
+| macOS Apple silicon | `aarch64-apple-darwin` (`.tar.gz`) |
+| macOS Intel | `x86_64-apple-darwin` (`.tar.gz`) |
 
 Then run it inside any Spring Boot repository — **no arguments needed**:
 

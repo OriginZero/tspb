@@ -49,11 +49,21 @@
 
 ## 快速开始
 
-从 GitHub Releases 下载对应平台的二进制放进 `PATH`；或者从源码安装（需要 Rust 1.85+）：
+从 [Releases](https://github.com/OriginZero/tspb/releases) 下载对应平台的二进制放进 `PATH`；或者从源码安装（需要 Rust 1.85+）：
 
 ```bash
 cargo install --path .
 ```
+
+每个 tag 都会附带按 `tspb-<tag>-<target>` 命名的预编译包：
+
+| 平台 | target |
+| --- | --- |
+| Windows x86_64 | `x86_64-pc-windows-msvc`（`.zip`） |
+| Linux x86_64 | `x86_64-unknown-linux-gnu`（`.tar.gz`） |
+| Linux arm64 | `aarch64-unknown-linux-gnu`（`.tar.gz`） |
+| macOS Apple silicon | `aarch64-apple-darwin`（`.tar.gz`） |
+| macOS Intel | `x86_64-apple-darwin`（`.tar.gz`） |
 
 然后在任意 Spring Boot 仓库里直接执行，**不需要任何参数**：
 

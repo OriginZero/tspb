@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Terminal UI launcher for Spring Boot: index JDKs, Maven and launchable modules, start with one key, watch logs in place."
 license = "MIT"
+repository = "https://github.com/OriginZero/tspb"
 readme = "README.md"
 keywords = ["spring-boot", "tui", "launcher", "java", "maven"]
 categories = ["command-line-utilities", "development-tools"]
