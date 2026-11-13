@@ -1510,3 +1510,38 @@ fn zoomed_rendering_hides_the_other_panes() {
         "the item list must be hidden while LOG is zoomed"
     );
 }
+
+/// No prefix, no palette: `z` inside a window goes full screen and back.
+#[test]
+fn z_toggles_full_screen_inside_a_window() {
+    let mut app = test_app();
+    app.handle(Action::Focus(2)); // jump into LOG
+    assert_eq!((app.layer, app.focus), (Layer::Content, Focus::Log));
+
+    app.handle(Action::Vim('z'));
+    assert_eq!(app.zoom, Some(Focus::Log));
+    assert_eq!(
+        app.focus,
+        Focus::Log,
+        "zooming keeps the cursor in the pane"
+    );
+
+    app.handle(Action::Vim('z'));
+    assert_eq!(app.zoom, None, "the same key restores the split layout");
+
+    // ITEMS behaves the same way.
+    app.handle(Action::Focus(1));
+    app.handle(Action::Vim('z'));
+    assert_eq!(app.zoom, Some(Focus::List));
+}
+
+#[test]
+fn bare_z_does_nothing_in_the_panes_layer() {
+    let mut app = test_app();
+    app.handle(Action::Vim('z'));
+    assert_eq!(
+        app.zoom, None,
+        "PANES keeps its 'nothing selected' rules; use Enter first"
+    );
+    assert_eq!(app.layer, Layer::Panes);
+}

@@ -607,6 +607,8 @@ impl App {
         // ---- layer-aware navigation: the same key means different things in
         // PANES (pick a window) and CONTENT (move inside that window). --------
         match action {
+            // One key, no prefix: full-screen the pane you are already in.
+            Action::Vim('z') if self.layer == Layer::Content => return self.toggle_zoom(),
             Action::Vim(c) => return self.navigate(c),
             Action::Move(d) => return self.navigate_move(d),
             Action::Enter => {
@@ -739,28 +741,7 @@ impl App {
                     self.toggle_log_pane();
                 }
             }
-            Action::Zoom => {
-                self.zoom = if self.zoom.is_some() {
-                    None
-                } else {
-                    // In PANES the highlight decides; in CONTENT the pane the
-                    // cursor is already inside.
-                    let target = if self.layer == Layer::Panes {
-                        self.hover.unwrap_or(self.focus)
-                    } else {
-                        self.focus
-                    };
-                    Some(target)
-                };
-                if let Some(pane) = self.zoom {
-                    self.message = format!(
-                        "{} zoomed to full screen · prefix z or Esc twice to restore",
-                        pane.label()
-                    );
-                } else {
-                    self.message = "split layout restored".into();
-                }
-            }
+            Action::Zoom => self.toggle_zoom(),
             Action::NextView => self.shift_view(1),
             Action::PrevView => self.shift_view(-1),
             Action::View(i) => {
@@ -1055,6 +1036,23 @@ impl App {
         self.hover = None;
         self.visual_anchor = None;
         self.zoom = None;
+    }
+
+    /// `z` inside a window, or `prefix z` from anywhere: show that pane on its
+    /// own, hiding every other one. Pressing it again restores the split.
+    fn toggle_zoom(&mut self) {
+        if self.zoom.take().is_some() {
+            self.message = "split layout restored · z shows one window".into();
+            return;
+        }
+        // In PANES the highlight decides; in CONTENT the window you are in.
+        let target = if self.layer == Layer::Panes {
+            self.hover.unwrap_or(self.focus)
+        } else {
+            self.focus
+        };
+        self.zoom = Some(target);
+        self.message = format!("{} full screen · z or Esc twice restores", target.label());
     }
 
     fn toggle_log_pane(&mut self) {

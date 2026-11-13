@@ -634,11 +634,11 @@ fn render_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
         }
         Layer::Content => match app.focus {
             Focus::List => {
-                " ITEMS: j/k move · h/l workspace · Enter launch/attach · / filter · s stop · R restart · Esc panes "
+                " ITEMS: j/k move · h/l view · Enter act · / filter · s stop · R restart · z full · Esc "
             }
-            Focus::Sidebar => " WORKSPACES: j/k or h/l switch view · Enter act · Esc panes ",
+            Focus::Sidebar => " WORKSPACES: j/k switch view · Enter act · z full · Esc panes ",
             Focus::Log => {
-                " LOG: j/k line · h/l page · v select · y yank line · Y yank all · g top · G tail · Esc panes "
+                " LOG: j/k line · h/l page · v select · y yank · Y all · g/G ends · z full · Esc "
             }
         },
     };
@@ -669,7 +669,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn render_help(f: &mut Frame<'_>, full: Rect, app: &App) {
-    let area = centered(full, 88, 32);
+    let area = centered(full, 88, 34);
     f.render_widget(Clear, area);
     let prefix = format!("ctrl+{}", app.prefix_char);
     let text = vec![
@@ -683,6 +683,7 @@ fn render_help(f: &mut Frame<'_>, full: Rect, app: &App) {
         h("  CONTENT - h/j/k/l act INSIDE the active window"),
         k("ITEMS j/k, h/l", "move selection / switch workspace"),
         k("WORKSPACES j/k/h/l", "switch workspace (view)"),
+        k("z", "full screen this window (again to restore)"),
         k("LOG j/k, h/l", "move yank cursor / page up-down"),
         k("LOG g / G / End", "first line / live tail"),
         k("Esc", "back to PANES (cancels VISUAL first)"),

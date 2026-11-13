@@ -235,6 +235,7 @@ Once a window is active, the same `h/j/k/l` only act **inside that window**; the
 | WORKSPACES | `j/k/h/l` | Switch workspace (All / Running / Projects / toolchain views) |
 | LOG | `j/k` | Move the log line cursor |
 | LOG | `h/l` | Page up / page down |
+| Any window | `z` | Full screen this window, hiding the others (`z` again to restore) |
 | Any | `Esc` | Back to PANES (cancels the visual selection first) |
 
 ### LOG: which service am I looking at?
@@ -358,7 +359,7 @@ src/
 │   └── process.rs    Running Spring Boot processes
 ├── clipboard.rs      System clipboard with temp-file fallback
 ├── update.rs         tspb update: GitHub release download, checksum, binary replace
-└── tests.rs          33 tests (real process start/log/stop, two-service log switching, ANSI styling, Vim layers, log copy, rendering, cwd resolution, key de-duplication, startup progress)
+└── tests.rs          35 tests (real process start/log/stop, two-service log switching, ANSI styling, Vim layers, log copy, rendering, cwd resolution, key de-duplication, startup progress)
 ```
 
 ## Contributing

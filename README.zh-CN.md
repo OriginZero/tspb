@@ -235,6 +235,7 @@ scan roots: <本次索引的仓库根目录>
 | WORKSPACES | `j/k/h/l` | 切换 workspace（All / Running / Projects / 工具链视图） |
 | LOG | `j/k` | 上下移动日志行光标 |
 | LOG | `h/l` | 上翻 / 下翻一页 |
+| 任意窗口 | `z` | 当前窗口全屏、隐藏其它窗口（再按 `z` 还原） |
 | 任意 | `Esc` | 退回 PANES（若处于 VISUAL，先取消选区） |
 
 ### LOG：多个服务之间怎么切
@@ -358,7 +359,7 @@ src/
 │   └── process.rs    运行中的 Spring Boot 进程
 ├── clipboard.rs      系统剪贴板写入与无剪贴板时的临时文件降级
 ├── update.rs         tspb update：下载 GitHub release、校验哈希、替换自身
-└── tests.rs          33 项测试（含真实进程启动/日志/停止、双服务日志切换、ANSI 着色、Vim 层导航、日志复制、渲染、cwd 定位、按键去重、启动进度页）
+└── tests.rs          35 项测试（含真实进程启动/日志/停止、双服务日志切换、ANSI 着色、Vim 层导航、日志复制、渲染、cwd 定位、按键去重、启动进度页）
 ```
 
 ## 参与贡献
