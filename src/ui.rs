@@ -146,10 +146,20 @@ fn render_header(f: &mut Frame<'_>, area: Rect, app: &App) {
         Span::raw(" "),
         view,
         layer,
+    ];
+    // Full screen hides the other panes: say so, or the missing layout looks
+    // like a rendering problem.
+    if app.zoom.is_some() {
+        spans.push(Span::styled(
+            " ZOOM ",
+            Style::default().fg(Color::Black).bg(Color::Magenta).bold(),
+        ));
+    }
+    spans.extend([
         Span::styled(format!(" @{root} "), Style::default().fg(Color::Cyan)),
         prefix_span,
         tools,
-    ];
+    ]);
     if let Some(sf) = app.status_filter {
         spans.push(Span::styled(
             format!(" [{}] ", sf.label()),

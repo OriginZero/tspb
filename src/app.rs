@@ -743,8 +743,23 @@ impl App {
                 self.zoom = if self.zoom.is_some() {
                     None
                 } else {
-                    Some(self.focus)
+                    // In PANES the highlight decides; in CONTENT the pane the
+                    // cursor is already inside.
+                    let target = if self.layer == Layer::Panes {
+                        self.hover.unwrap_or(self.focus)
+                    } else {
+                        self.focus
+                    };
+                    Some(target)
                 };
+                if let Some(pane) = self.zoom {
+                    self.message = format!(
+                        "{} zoomed to full screen · prefix z or Esc twice to restore",
+                        pane.label()
+                    );
+                } else {
+                    self.message = "split layout restored".into();
+                }
             }
             Action::NextView => self.shift_view(1),
             Action::PrevView => self.shift_view(-1),
@@ -1063,6 +1078,12 @@ impl App {
         self.hover = Some(f);
         self.layer = Layer::Content;
         self.visual_anchor = None;
+        // A zoomed layout always shows the pane you are in: without this,
+        // escaping to PANES and entering another window keeps the old one on
+        // screen and the Enter looks like it did nothing.
+        if self.zoom.is_some() {
+            self.zoom = Some(f);
+        }
         if f == Focus::Log {
             // Never re-enable follow just by entering the pane: a frozen view
             // (after j/k or while yanking) must stay exactly where it is.

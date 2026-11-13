@@ -274,7 +274,7 @@ scan roots: <本次索引的仓库根目录>
 | `prefix h/l/j`、`prefix 1/2/3` | 直接进入 WORKSPACES / ITEMS / LOG 的 CONTENT 层 |
 | `prefix v` 或 `prefix -` | 分割 / 切换实时日志 pane |
 | `prefix x` | 关闭日志 pane |
-| `prefix z` | 放大当前 pane |
+| `prefix z` | 把高亮 / 当前 pane 放大到全屏（再按一次，或连按两次 `Esc` 还原） |
 | `prefix b` | 显示/隐藏 sidebar |
 | `prefix w/n/p` | 切换 workspace（All / Running / Projects / Env toolchains / IDEA toolchains） |
 | `prefix r` | 重新扫描全部四类信息 |
@@ -358,7 +358,7 @@ src/
 │   └── process.rs    运行中的 Spring Boot 进程
 ├── clipboard.rs      系统剪贴板写入与无剪贴板时的临时文件降级
 ├── update.rs         tspb update：下载 GitHub release、校验哈希、替换自身
-└── tests.rs          30 项测试（含真实进程启动/日志/停止、双服务日志切换、ANSI 着色、Vim 层导航、日志复制、渲染、cwd 定位、按键去重、启动进度页）
+└── tests.rs          33 项测试（含真实进程启动/日志/停止、双服务日志切换、ANSI 着色、Vim 层导航、日志复制、渲染、cwd 定位、按键去重、启动进度页）
 ```
 
 ## 参与贡献

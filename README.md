@@ -274,7 +274,7 @@ Press the prefix, release it, then press a key — that key belongs to the TUI a
 | `prefix h/l/j`, `prefix 1/2/3` | Jump into WORKSPACES / ITEMS / LOG CONTENT |
 | `prefix v` or `prefix -` | Split / toggle the live log pane |
 | `prefix x` | Close the log pane |
-| `prefix z` | Zoom the current pane |
+| `prefix z` | Zoom the highlighted / current pane to full screen (again, or `Esc` twice, to restore) |
 | `prefix b` | Show / hide the sidebar |
 | `prefix w/n/p` | Switch workspace (All / Running / Projects / Env toolchains / IDEA toolchains) |
 | `prefix r` | Rescan all four categories |
@@ -358,7 +358,7 @@ src/
 │   └── process.rs    Running Spring Boot processes
 ├── clipboard.rs      System clipboard with temp-file fallback
 ├── update.rs         tspb update: GitHub release download, checksum, binary replace
-└── tests.rs          30 tests (real process start/log/stop, two-service log switching, ANSI styling, Vim layers, log copy, rendering, cwd resolution, key de-duplication, startup progress)
+└── tests.rs          33 tests (real process start/log/stop, two-service log switching, ANSI styling, Vim layers, log copy, rendering, cwd resolution, key de-duplication, startup progress)
 ```
 
 ## Contributing

@@ -1441,3 +1441,72 @@ fn colourised_output_renders_as_style_and_yanks_as_plain_text() {
     let _ = app.runner.stop(&id);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// `prefix z` already had a renderer; these two cover the state transitions
+/// around it, which used to leave the wrong pane on screen.
+#[test]
+fn zoom_follows_the_pane_you_enter() {
+    let mut app = test_app();
+    app.handle(Action::Focus(2)); // jump into LOG
+    assert_eq!(app.focus, Focus::Log);
+    app.handle(Action::Zoom);
+    assert_eq!(app.zoom, Some(Focus::Log));
+
+    // Leave to PANES, highlight WORKSPACES, enter it: the zoom must follow,
+    // otherwise the layout keeps showing LOG and Enter looks broken.
+    app.handle(Action::Esc);
+    assert_eq!(app.layer, Layer::Panes);
+    app.handle(Action::Vim('h'));
+    assert_eq!(app.hover, Some(Focus::Sidebar));
+    app.handle(Action::Enter);
+    assert_eq!(app.focus, Focus::Sidebar);
+    assert_eq!(app.zoom, Some(Focus::Sidebar));
+
+    app.handle(Action::Zoom);
+    assert_eq!(app.zoom, None, "prefix z toggles back to the split layout");
+}
+
+#[test]
+fn zoom_in_panes_uses_the_highlighted_pane() {
+    let mut app = test_app();
+    assert_eq!((app.layer, app.hover), (Layer::Panes, None));
+    app.handle(Action::Vim('j')); // highlight LOG without entering it
+    assert_eq!(app.hover, Some(Focus::Log));
+    app.handle(Action::Zoom);
+    assert_eq!(
+        app.zoom,
+        Some(Focus::Log),
+        "the highlight decides without entering the pane"
+    );
+    assert_eq!(app.layer, Layer::Panes, "zooming must not enter the pane");
+}
+
+#[test]
+fn zoomed_rendering_hides_the_other_panes() {
+    let mut app = test_app();
+    app.handle(Action::Focus(2));
+    app.handle(Action::Zoom);
+
+    let mut terminal = Terminal::new(TestBackend::new(110, 28)).unwrap();
+    terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        screen.contains("ZOOM"),
+        "the header flags the full-screen mode"
+    );
+    assert!(screen.contains("LOG"), "the zoomed pane is the one drawn");
+    assert!(
+        !screen.contains("WORKSPACES"),
+        "the sidebar must be hidden while LOG is zoomed"
+    );
+    assert!(
+        !screen.contains(" ITEMS ("),
+        "the item list must be hidden while LOG is zoomed"
+    );
+}
