@@ -194,9 +194,10 @@ fn render_body(f: &mut Frame<'_>, body: Rect, app: &mut App) {
     };
     app.hitboxes.sidebar = sidebar_area;
 
-    let mut rows = vec![Constraint::Min(5), Constraint::Length(5)];
+    let mut rows = vec![Constraint::Min(5), Constraint::Length(6)];
     if app.show_log {
-        rows.push(Constraint::Length(12));
+        // DETAIL gained the LIVE LOG line, so the log keeps the 24-row total.
+        rows.push(Constraint::Length(11));
     }
     let parts = Layout::vertical(rows).split(right);
     app.hitboxes.list = parts[0];
@@ -371,6 +372,36 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, app: &App) {
         })
         .unwrap_or_else(|| "-".into());
 
+    // Same source the LOG pane renders from, so DETAIL can never disagree with
+    // the stream below it (two configs of one module are told apart by pid).
+    let live = app.current_log_id().map(|id| {
+        (
+            app.runner.managed.get(&id).map(|m| m.pid).unwrap_or(0),
+            app.runner.log_len(&id),
+        )
+    });
+    let log_line = match live {
+        Some((pid, lines)) => Line::from(vec![
+            Span::styled(" LIVE LOG  ", Style::default().fg(DIM)),
+            Span::styled(
+                format!("pid {pid}  {lines} lines  "),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                if app.log_follow { "FOLLOW" } else { "SCROLL" },
+                Style::default().fg(if app.log_follow {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
+            ),
+        ]),
+        None => Line::from(vec![
+            Span::styled(" LIVE LOG  ", Style::default().fg(DIM)),
+            Span::styled("no stream for this row", Style::default().fg(DIM)),
+        ]),
+    };
+
     let lines = vec![
         Line::from(vec![
             Span::styled(" SELECTED  ", Style::default().fg(DIM)),
@@ -417,6 +448,7 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(Color::Magenta),
             ),
         ]),
+        log_line,
     ];
     f.render_widget(
         Paragraph::new(lines).block(

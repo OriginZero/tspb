@@ -985,3 +985,173 @@ fn startup_progress_renders_stage_counters_and_clips_long_paths() {
         tiny.draw(|f| crate::progress::render(f, &snap)).unwrap();
     }
 }
+
+/// Start a fake `spring-boot:run` shim that prints `{tag}_READY`, then stays
+/// alive for ~30s. Two of them give the TUI two independent streams to switch
+/// between, exercising `current_log_id()` the way two real services would.
+#[cfg(windows)]
+fn fake_service(dir: &str, tag: &str, jdk: &Jdk, runner: &mut Runner) -> (Project, String) {
+    use std::fs;
+    let tmp = std::env::temp_dir().join(format!("tspb-svc-{}-{dir}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let bin = tmp.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("mvn.cmd"),
+        format!(
+            "@echo off\r\necho {tag}_READY\r\necho {tag}_SECOND\r\nping -n 30 127.0.0.1 >nul\r\n"
+        ),
+    )
+    .unwrap();
+    let mvn = Maven {
+        name: format!("mvn-{dir}"),
+        home: tmp.clone(),
+        version: "3".into(),
+        executable: bin.join("mvn.cmd"),
+        origin: Origin::Env,
+        wrapper: false,
+    };
+    let project = Project {
+        name: dir.into(),
+        path: tmp,
+        build: BuildTool::Maven,
+        has_wrapper: false,
+        main_class: None,
+        java_version: None,
+        launch_configs: vec![launch_config("auto", "auto")],
+        origin: Origin::Project,
+    };
+    let id = runner
+        .launch(
+            &project,
+            &project.launch_configs[0],
+            jdk,
+            Some(&mvn),
+            &Config::default(),
+        )
+        .unwrap();
+    (project, id)
+}
+
+#[cfg(windows)]
+fn wait_for_line(runner: &mut Runner, id: &str, needle: &str) {
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        runner.poll();
+        if runner.logs_for(id).iter().any(|l| l.contains(needle)) {
+            return;
+        }
+    }
+    panic!("log line {needle} never appeared for {id}");
+}
+
+#[cfg(windows)]
+#[test]
+fn selecting_another_running_row_switches_detail_and_log() {
+    let jdk = Jdk {
+        name: "test-jdk".into(),
+        home: std::env::temp_dir(),
+        version: "17".into(),
+        java: PathBuf::from("java.exe"),
+        origin: Origin::Env,
+    };
+    let mut runner = Runner::new(200);
+    let (proj_a, id_a) = fake_service("svc-a", "ALPHA", &jdk, &mut runner);
+    let (proj_b, id_b) = fake_service("svc-b", "BETA", &jdk, &mut runner);
+    wait_for_line(&mut runner, &id_a, "ALPHA_READY");
+    wait_for_line(&mut runner, &id_b, "BETA_READY");
+    let pid_a = runner.managed[&id_a].pid;
+    let pid_b = runner.managed[&id_b].pid;
+
+    let mut app = test_app();
+    app.inv.projects = vec![proj_a, proj_b];
+    app.runner = runner;
+    app.rebuild_rows();
+
+    let row_of = |app: &App, name: &str| {
+        app.rows
+            .iter()
+            .position(|r| {
+                matches!(r.kind, RowKind::App { pid: Some(_), .. }) && r.label.starts_with(name)
+            })
+            .unwrap_or_else(|| panic!("no running row for {name}"))
+    };
+    let (row_a, row_b) = (row_of(&app, "svc-a"), row_of(&app, "svc-b"));
+
+    // Cursor on A: log, DETAIL and the live pid must all follow A.
+    app.selected = row_a;
+    app.tick();
+    assert_eq!(app.current_log_id().as_deref(), Some(id_a.as_str()));
+    assert_eq!(app.log_cursor, app.runner.log_len(&id_a).saturating_sub(1));
+
+    // Cursor on B: the pane switches without pressing Enter on it first.
+    app.selected = row_b;
+    app.tick();
+    assert_eq!(app.current_log_id().as_deref(), Some(id_b.as_str()));
+    assert_eq!(app.selected_log_id.as_deref(), Some(id_b.as_str()));
+    assert!(
+        app.log_follow,
+        "switching rows re-attaches to the live tail"
+    );
+    assert_eq!(app.log_cursor, app.runner.log_len(&id_b).saturating_sub(1));
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        screen.contains("BETA_READY"),
+        "LOG pane should render the selected stream"
+    );
+    assert!(
+        !screen.contains("ALPHA_READY"),
+        "the other service's stream must not leak into the pane"
+    );
+    // The list shows every pid, so check the DETAIL/LIVE LOG line specifically.
+    let detail_row = screen
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(120)
+        .map(|c| c.iter().collect::<String>())
+        .find(|r| r.contains("LIVE LOG"))
+        .expect("DETAIL renders a LIVE LOG line");
+    assert!(
+        detail_row.contains(&format!("pid {pid_b}")),
+        "DETAIL must report the pid of the selected row: {detail_row}"
+    );
+    assert!(
+        !detail_row.contains(&format!("pid {pid_a}")),
+        "DETAIL still points at the previous row: {detail_row}"
+    );
+
+    // Going back works the same way, and toolchain rows keep the last stream.
+    app.selected = row_a;
+    app.tick();
+    assert_eq!(app.current_log_id().as_deref(), Some(id_a.as_str()));
+    let jdk_row = app
+        .rows
+        .iter()
+        .position(|r| matches!(r.kind, RowKind::Jdk(_)))
+        .expect("inventory has a JDK row");
+    app.selected = jdk_row;
+    app.tick();
+    assert_eq!(
+        app.current_log_id().as_deref(),
+        Some(id_a.as_str()),
+        "a non-app row keeps the last stream instead of blanking the pane"
+    );
+
+    let _ = app.runner.stop(&id_a);
+    let _ = app.runner.stop(&id_b);
+    for dir in ["svc-a", "svc-b"] {
+        let _ = std::fs::remove_dir_all(
+            std::env::temp_dir().join(format!("tspb-svc-{}-{dir}", std::process::id())),
+        );
+    }
+}
+

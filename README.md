@@ -237,6 +237,12 @@ Once a window is active, the same `h/j/k/l` only act **inside that window**; the
 | LOG | `h/l` | Page up / page down |
 | Any | `Esc` | Back to PANES (cancels the visual selection first) |
 
+### LOG: which service am I looking at?
+
+Every launched service owns its own ring buffer (`log_capacity` lines) filled by two reader threads, one for stdout and one for stderr, so several services can boot at once without their output mixing. **The pane follows the cursor**: move the selection onto another `RUNNING` entry and DETAIL plus LOG switch to that stream immediately — no `Enter` needed — with the scroll position reset to the live tail. Rows without a stream (JDKs, Mavens, projects that are not running) keep the last stream instead of blanking the pane. Two launch configurations of the same module stay apart because the pid, not the path, identifies the stream, and DETAIL repeats the pid currently shown in LOG.
+
+Because buffers are bounded, a service you have not looked at for a long time has dropped its earliest lines; `Enter` on its row re-opens what is still buffered.
+
 ### LOG: copy, line selection, scrollbar
 
 The LOG pane opens in `SCROLL` mode; the scrollbar on the right shows where the line cursor sits in the whole log, and the reverse-video line is what `y` copies.

@@ -133,6 +133,8 @@ pub struct App {
     pub log_scroll: usize,
     /// Absolute index of the yank/scroll cursor inside the log ring buffer.
     pub log_cursor: usize,
+    /// The stream the LOG pane showed last tick; a change resets scroll/follow.
+    pub shown_log_id: Option<String>,
     /// `v` anchors a visual line selection; `y` yanks anchor..cursor.
     pub visual_anchor: Option<usize>,
     /// Last yanked text (also the fallback when no OS clipboard is reachable).
@@ -200,6 +202,7 @@ impl App {
             log_follow: true,
             log_scroll: 0,
             log_cursor: 0,
+            shown_log_id: None,
             visual_anchor: None,
             clipboard: None,
             log_view_height: 10,
@@ -544,25 +547,28 @@ impl App {
             .unwrap_or_else(|| "-".into())
     }
 
+    /// The stream the LOG pane renders. The selected row wins, so moving the
+    /// cursor over a RUNNING entry switches the pane immediately; the pid match
+    /// keeps two launch configs of the same module apart. `selected_log_id` is
+    /// only a fallback for rows that carry no stream (JDK / Maven / idle project),
+    /// which keeps the pane from blanking out while you browse toolchains.
     pub fn current_log_id(&self) -> Option<String> {
-        if let Some(id) = &self.selected_log_id
-            && self.runner.managed.contains_key(id)
-        {
-            return Some(id.clone());
-        }
-        let row = self.current_row()?;
-        if let RowKind::App { project, pid } = row.kind {
-            if let Some(pid) = pid
-                && let Some(m) = self.runner.find_by_pid(pid)
-            {
-                return Some(m.id.clone());
-            }
-            if let Some(pi) = project {
-                let path = &self.inv.projects[pi].path;
-                return self.runner.find_by_project(path).map(|m| m.id.clone());
-            }
-        }
-        None
+        let from_row = self.current_row().and_then(|row| match row.kind {
+            RowKind::App { project, pid } => pid
+                .and_then(|pid| self.runner.find_by_pid(pid))
+                .map(|m| m.id.clone())
+                .or_else(|| {
+                    project
+                        .and_then(|pi| self.runner.find_by_project(&self.inv.projects[pi].path))
+                        .map(|m| m.id.clone())
+                }),
+            _ => None,
+        });
+        from_row.or_else(|| {
+            self.selected_log_id
+                .clone()
+                .filter(|id| self.runner.managed.contains_key(id))
+        })
     }
 
     // ---------------------------------------------------------------- actions
@@ -1411,10 +1417,25 @@ impl App {
 
     pub fn tick(&mut self) {
         self.runner.poll();
+        self.sync_log_target();
         if self.last_proc_refresh.elapsed() >= Duration::from_secs(3) {
             self.refresh_processes();
             self.last_proc_refresh = Instant::now();
         }
+    }
+
+    /// Follow the cursor: when the selected row points at another stream, drop
+    /// the old scroll position, visual selection and jump back to the live tail.
+    fn sync_log_target(&mut self) {
+        let id = self.current_log_id();
+        if id == self.shown_log_id {
+            return;
+        }
+        self.shown_log_id = id.clone();
+        self.selected_log_id = id;
+        self.visual_anchor = None;
+        self.log_follow = true;
+        self.sync_log_view();
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
