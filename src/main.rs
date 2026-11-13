@@ -6,6 +6,7 @@ mod model;
 mod runner;
 mod scan;
 mod ui;
+mod update;
 
 #[cfg(test)]
 mod tests;
@@ -28,6 +29,13 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_cli_help();
         return Ok(());
+    }
+
+    if args.first().map(String::as_str) == Some("update") {
+        return update::run(update::Options {
+            version: arg_value(&args, "--version"),
+            mirror: arg_value(&args, "--mirror"),
+        });
     }
 
     let mut cfg = config::Config::load()?;
@@ -387,6 +395,7 @@ fn print_cli_help() {
          tspb --launch NAME              start one project headlessly and stream its log\n  \
          tspb --wide                     index every configured/IDEA project tree\n  \
          tspb --init-config              write a default config.toml and exit\n  \
+         tspb update                     replace this binary with the latest release\n  \
          tspb --help                     show this help\n\
          \nOPTIONS:\n  \
          --root DIR [DIR...]       index this tree instead of the current directory\n  \
@@ -396,6 +405,12 @@ fn print_cli_help() {
          --jdk SUBSTRING           force a JDK by name (overrides pom version matching)\n  \
          --watch-seconds N         log window for --launch (default 90)\n  \
          --detach                  keep the --launch process running on exit\n\
+         \nUPDATE:\n  \
+         tspb update               fetch the latest release and replace this binary\n  \
+         tspb update --version TAG install a specific release (with or without the v)\n  \
+         tspb update --mirror URL  download through a GitHub mirror prefix\n  \
+         TSPB_MIRROR=URL           same as --mirror; without it, the direct URL is\n  \
+                                   tried first and public mirrors are used as fallback\n\
          \nEXAMPLES:\n  \
          cd /path/to/your-spring-repo && tspb\n  \
          tspb --root /path/to/your-spring-repo --scan-only\n  \

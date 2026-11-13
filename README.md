@@ -3,7 +3,7 @@
 **English** | [中文](README.zh-CN.md)
 
 ![license](https://img.shields.io/badge/license-MIT-blue)
-![rust](https://img.shields.io/badge/rust-1.85%2B-orange)
+![rust](https://img.shields.io/badge/rust-1.88%2B-orange)
 ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
 A terminal launcher for Spring Boot, written in Rust. It indexes your JDKs, Maven installs and launchable modules, starts one with a single key, and keeps the log right next to it — then gives the memory back when you quit.
@@ -47,15 +47,23 @@ When you need to edit code, set breakpoints or refactor, go back to your IDE.
 | Stream logs | Ring buffer plus FOLLOW, scrollable, copyable (line / selection / all) |
 | Manage lifetime | Stop, restart, detach, stop-all-and-quit; Windows kills the whole process tree |
 
-## Quick start
+## Install
 
-Download the binary for your platform from [Releases](https://github.com/OriginZero/tspb/releases) and put it on your `PATH`, or install from source (Rust 1.85+):
+Linux / macOS:
 
 ```bash
-cargo install --path .
+curl -fsSL https://raw.githubusercontent.com/OriginZero/tspb/main/install.sh | sh
 ```
 
-Every tag ships prebuilt binaries named `tspb-<tag>-<target>`:
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/OriginZero/tspb/main/install.ps1 | iex
+```
+
+The installer detects the platform and architecture, verifies the release checksum when the release ships `SHA256SUMS.txt`, installs into `~/.local/bin` (`%LOCALAPPDATA%\Programs\tspb` on Windows) and adds that directory to your `PATH` if it is missing.
+
+Rather do it by hand? Every tag ships prebuilt binaries named `tspb-<tag>-<target>`:
 
 | Platform | Target triple |
 | --- | --- |
@@ -65,7 +73,15 @@ Every tag ships prebuilt binaries named `tspb-<tag>-<target>`:
 | macOS Apple silicon | `aarch64-apple-darwin` (`.tar.gz`) |
 | macOS Intel | `x86_64-apple-darwin` (`.tar.gz`) |
 
-Then run it inside any Spring Boot repository — **no arguments needed**:
+Or build from source (Rust 1.88+):
+
+```bash
+cargo install --path .
+```
+
+## Quick start
+
+Run it inside any Spring Boot repository — **no arguments needed**:
 
 ```bash
 cd /path/to/your-spring-repo
@@ -129,6 +145,7 @@ Toolchain: `rust-toolchain.toml` only pins the `stable` channel and the `rustfmt
 | `--detach` | Keep the `--launch` process running on exit |
 | `--jdk SUBSTRING` | Force a JDK by name, overriding pom version matching |
 | `--init-config` / `--help` | Write a default config / show help |
+| `update` | Replace this binary with a release (`--version TAG`, `--mirror URL`) |
 
 ```bash
 # Simplest use: go to the repo, open the TUI
@@ -144,6 +161,18 @@ tspb --launch your-start-module --watch-seconds 180
 ```
 
 On failure, `--launch` also prints a `diagnosis` block that picks the real root cause out of the log (`Caused by:`, `CommunicationsException`, `BindException`, …) instead of Maven's generic help text.
+
+## Updating
+
+```bash
+tspb update                        # latest release
+tspb update --version v0.1.0       # reinstall a specific release
+tspb update --mirror https://ghfast.top/   # same as TSPB_MIRROR=...
+```
+
+`update` asks the GitHub API for the latest tag, downloads the archive for your target triple, verifies it against the release `SHA256SUMS.txt` when present, and replaces the running binary (on Windows the old one is parked as `tspb.exe.old` until the next update).
+
+**Mirrors:** by default the direct `github.com` URL is tried first, then each public mirror in `update.rs` (`MIRRORS`) is used as a fallback — handy when GitHub is slow or blocked. Set `TSPB_MIRROR` (or `--mirror`) to pin a single prefix instead; the value is prepended to the real URL verbatim, e.g. `https://ghfast.top/`. `install.sh` and `install.ps1` use the same fallback order.
 
 ## Verification
 
@@ -307,6 +336,7 @@ src/
 │   ├── project.rs    Repository root, launchable filter, main class, java.version, IDEA run configs
 │   └── process.rs    Running Spring Boot processes
 ├── clipboard.rs      System clipboard with temp-file fallback
+├── update.rs         tspb update: GitHub release download, checksum, binary replace
 └── tests.rs          20 tests (real process start/log/stop, Vim layers, log copy, rendering, cwd resolution, key de-duplication)
 ```
 

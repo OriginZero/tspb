@@ -3,7 +3,7 @@
 [English](README.md) | **中文**
 
 ![license](https://img.shields.io/badge/license-MIT-blue)
-![rust](https://img.shields.io/badge/rust-1.85%2B-orange)
+![rust](https://img.shields.io/badge/rust-1.88%2B-orange)
 ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
 用 Rust 写的 Spring Boot 终端启动器。在仓库里索引 JDK / Maven / 可启动模块，一个键拉起进程，日志就在旁边，退出即释放内存。
@@ -47,15 +47,23 @@
 | 实时日志 | ring buffer + FOLLOW，可滚动、可复制（行 / 选区 / 全部） |
 | 生命周期 | 停止 / 重启 / detach / 停止全部退出，Windows 杀整棵进程树 |
 
-## 快速开始
+## 安装
 
-从 [Releases](https://github.com/OriginZero/tspb/releases) 下载对应平台的二进制放进 `PATH`；或者从源码安装（需要 Rust 1.85+）：
+Linux / macOS：
 
 ```bash
-cargo install --path .
+curl -fsSL https://raw.githubusercontent.com/OriginZero/tspb/main/install.sh | sh
 ```
 
-每个 tag 都会附带按 `tspb-<tag>-<target>` 命名的预编译包：
+Windows（PowerShell）：
+
+```powershell
+irm https://raw.githubusercontent.com/OriginZero/tspb/main/install.ps1 | iex
+```
+
+安装脚本会检测平台与架构，release 带 `SHA256SUMS.txt` 时校验哈希，装到 `~/.local/bin`（Windows 为 `%LOCALAPPDATA%\Programs\tspb`），该目录不在 `PATH` 里时会自动加上。
+
+想手动安装也行，每个 tag 都会附带按 `tspb-<tag>-<target>` 命名的预编译包：
 
 | 平台 | target |
 | --- | --- |
@@ -65,7 +73,15 @@ cargo install --path .
 | macOS Apple silicon | `aarch64-apple-darwin`（`.tar.gz`） |
 | macOS Intel | `x86_64-apple-darwin`（`.tar.gz`） |
 
-然后在任意 Spring Boot 仓库里直接执行，**不需要任何参数**：
+从源码安装（需要 Rust 1.88+）：
+
+```bash
+cargo install --path .
+```
+
+## 快速开始
+
+在任意 Spring Boot 仓库里直接执行，**不需要任何参数**：
 
 ```bash
 cd /path/to/your-spring-repo
@@ -129,6 +145,7 @@ path/to/tspb.exe          # Windows；Linux/macOS 为 tspb
 | `--detach` | `--launch` 结束时保留进程继续运行 |
 | `--jdk SUBSTRING` | 按名称强制指定 JDK，覆盖 pom 版本匹配 |
 | `--init-config` / `--help` | 生成默认配置 / 查看帮助 |
+| `update` | 更新到最新 release（`--version TAG`、`--mirror URL`） |
 
 ```bash
 # 最简单的用法：进目录，直接开 TUI
@@ -144,6 +161,18 @@ tspb --launch your-start-module --watch-seconds 180
 ```
 
 `--launch` 在失败时会额外打印 `diagnosis`，从日志里挑出 `Caused by:` / `CommunicationsException` / `BindException` 等根因行，而不是 Maven 的通用帮助文本。
+
+## 更新
+
+```bash
+tspb update                              # 最新版本
+tspb update --version v0.1.0             # 重装指定版本
+tspb update --mirror https://ghfast.top/ # 等价于 TSPB_MIRROR=...
+```
+
+`update` 会向 GitHub API 查最新 tag，下载对应 target 的压缩包，release 提供 `SHA256SUMS.txt` 时先校验哈希，然后替换当前可执行文件（Windows 上旧文件先改名成 `tspb.exe.old`，下次更新时清理）。
+
+**镜像加速：** 默认先直连 `github.com`，失败后依次尝试 `update.rs` 里 `MIRRORS` 列出的公共镜像，适合 GitHub 慢或被墙的网络；设置 `TSPB_MIRROR`（或 `--mirror`）则只走指定的前缀，值会被原样拼在真实 URL 前面，例如 `https://ghfast.top/`。`install.sh` 与 `install.ps1` 使用同样的顺序。
 
 ## 验证
 
@@ -307,6 +336,7 @@ src/
 │   ├── project.rs    仓库根定位、可启动项过滤、主类、java.version、IDEA run configuration
 │   └── process.rs    运行中的 Spring Boot 进程
 ├── clipboard.rs      系统剪贴板写入与无剪贴板时的临时文件降级
+├── update.rs         tspb update：下载 GitHub release、校验哈希、替换自身
 └── tests.rs          20 项测试（含真实进程启动/日志/停止、Vim 层导航、日志复制、渲染、cwd 定位、按键去重）
 ```
 

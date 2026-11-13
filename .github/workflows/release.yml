@@ -83,6 +83,13 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Checksums
+        # install.sh / install.ps1 / `tspb update` verify downloads against this.
+        run: |
+          cd dist
+          sha256sum tspb-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
