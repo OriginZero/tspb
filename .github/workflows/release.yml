@@ -52,15 +52,17 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          cd "target/${{ matrix.target }}/release"
-          tar -czf "tspb-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" tspb
+          # Write the archive to the workspace root: the artifact upload glob is
+          # resolved relative to the workspace, not to target/<target>/release.
+          tar -czf "$GITHUB_WORKSPACE/tspb-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" tspb
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           Compress-Archive -Path "target/${{ matrix.target }}/release/tspb.exe" `
-            -DestinationPath "tspb-${{ github.ref_name }}-${{ matrix.target }}.zip"
+            -DestinationPath "$env:GITHUB_WORKSPACE/tspb-${{ github.ref_name }}-${{ matrix.target }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
