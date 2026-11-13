@@ -136,6 +136,12 @@ impl Runner {
     pub fn poll(&mut self) {
         for m in self.managed.values_mut() {
             if let Ok(Some(status)) = m.child.try_wait() {
+                // `try_wait` keeps returning `Some` once the child is reaped, and
+                // poll runs on every tick: record the exit exactly once, or the
+                // ring buffer fills up with identical "[process exited]" lines.
+                if matches!(m.state, RunState::Exited | RunState::Failed) {
+                    continue;
+                }
                 m.state = if status.success() {
                     RunState::Exited
                 } else {

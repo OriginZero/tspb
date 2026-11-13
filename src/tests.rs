@@ -1164,6 +1164,77 @@ fn selecting_another_running_row_switches_detail_and_log() {
     }
 }
 
+/// `Child::try_wait` keeps returning `Some` after the child is reaped, so a
+/// naive `poll` loop appended "[process exited]" on every tick and flooded the
+/// ring buffer. The exit must be recorded once, no matter how often we poll.
+#[cfg(windows)]
+#[test]
+fn exit_status_is_logged_exactly_once() {
+    let tmp = std::env::temp_dir().join(format!("tspb-exit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let bin = tmp.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("mvn.cmd"),
+        "@echo off\r\necho BOOT_FAILED\r\nexit /b 1\r\n",
+    )
+    .unwrap();
+    let jdk = Jdk {
+        name: "test-jdk".into(),
+        home: tmp.clone(),
+        version: "17".into(),
+        java: bin.join("java.exe"),
+        origin: Origin::Env,
+    };
+    let mvn = Maven {
+        name: "fake-maven".into(),
+        home: tmp.clone(),
+        version: "3".into(),
+        executable: bin.join("mvn.cmd"),
+        origin: Origin::Env,
+        wrapper: false,
+    };
+    let project = Project {
+        name: "breaking-app".into(),
+        path: tmp.clone(),
+        build: BuildTool::Maven,
+        has_wrapper: false,
+        main_class: None,
+        java_version: None,
+        launch_configs: vec![launch_config("auto", "auto")],
+        origin: Origin::Project,
+    };
+    let mut runner = Runner::new(100);
+    let id = runner
+        .launch(
+            &project,
+            &project.launch_configs[0],
+            &jdk,
+            Some(&mvn),
+            &Config::default(),
+        )
+        .unwrap();
+
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        runner.poll();
+    }
+    // Simulate the UI keeping on ticking long after the process is gone.
+    for _ in 0..30 {
+        runner.poll();
+    }
+
+    let logs = runner.logs_for(&id);
+    let exits = logs
+        .iter()
+        .filter(|l| l.contains("[process exited"))
+        .count();
+    assert_eq!(exits, 1, "exit reported once, got {exits}: {logs:?}");
+    assert!(logs.iter().any(|l| l.contains("BOOT_FAILED")));
+    assert_eq!(runner.managed[&id].state, RunState::Failed);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// Two behaviours that pull in opposite directions: a live stream must keep the
 /// cursor on the tail, while a yank must not move the viewport at all.
 #[cfg(windows)]
