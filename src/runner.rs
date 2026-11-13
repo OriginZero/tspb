@@ -164,6 +164,11 @@ impl Runner {
         let Some(mut m) = self.managed.remove(id) else {
             anyhow::bail!("no managed process: {id}");
         };
+        // Already gone: taskkill rejects a dead pid, and "stop failed" would be
+        // a lie for a process that exited on its own.
+        if matches!(m.child.try_wait(), Ok(Some(_))) {
+            return Ok(());
+        }
         push_line(&m.logs, self.capacity, "[stop requested]".into());
         kill_tree(m.pid)?;
         let _ = m.child.wait();

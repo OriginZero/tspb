@@ -356,7 +356,7 @@ src/
 │   └── process.rs    运行中的 Spring Boot 进程
 ├── clipboard.rs      系统剪贴板写入与无剪贴板时的临时文件降级
 ├── update.rs         tspb update：下载 GitHub release、校验哈希、替换自身
-└── tests.rs          24 项测试（含真实进程启动/日志/停止、Vim 层导航、日志复制、渲染、cwd 定位、按键去重、启动进度页）
+└── tests.rs          27 项测试（含真实进程启动/日志/停止、双服务日志切换、Vim 层导航、日志复制、渲染、cwd 定位、按键去重、启动进度页）
 ```
 
 ## 参与贡献

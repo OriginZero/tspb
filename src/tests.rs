@@ -1232,6 +1232,12 @@ fn exit_status_is_logged_exactly_once() {
     assert_eq!(exits, 1, "exit reported once, got {exits}: {logs:?}");
     assert!(logs.iter().any(|l| l.contains("BOOT_FAILED")));
     assert_eq!(runner.managed[&id].state, RunState::Failed);
+    // Sweeping the dead entry must not report a taskkill failure.
+    assert!(
+        runner.stop(&id).is_ok(),
+        "stopping an already exited process is a no-op, not an error"
+    );
+    assert!(!runner.managed.contains_key(&id));
     let _ = std::fs::remove_dir_all(&tmp);
 }
 

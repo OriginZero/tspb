@@ -356,7 +356,7 @@ src/
 │   └── process.rs    Running Spring Boot processes
 ├── clipboard.rs      System clipboard with temp-file fallback
 ├── update.rs         tspb update: GitHub release download, checksum, binary replace
-└── tests.rs          24 tests (real process start/log/stop, Vim layers, log copy, rendering, cwd resolution, key de-duplication, startup progress)
+└── tests.rs          27 tests (real process start/log/stop, two-service log switching, Vim layers, log copy, rendering, cwd resolution, key de-duplication, startup progress)
 ```
 
 ## Contributing
