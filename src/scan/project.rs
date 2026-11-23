@@ -215,9 +215,72 @@ fn looks_like_spring_boot(raw: &str, dir: &Path) -> bool {
                 .to_string_lossy()
                 .ends_with("Application.java")
                 && fs::read_to_string(e.path())
-                    .map(|s| s.contains("@SpringBootApplication"))
+                    .map(|s| strip_comments(&s).contains("@SpringBootApplication"))
                     .unwrap_or(false)
         })
+}
+
+
+/// Strip single-line `//` and multi-line `/* */` comments from Java/Kotlin source,
+/// respecting string literals.
+pub(crate) fn strip_comments(code: &str) -> String {
+    let mut res = String::with_capacity(code.len());
+    let mut chars = code.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '/' {
+            if let Some(&'/') = chars.peek() {
+                chars.next();
+                for next_c in chars.by_ref() {
+                    if next_c == '\n' {
+                        res.push('\n');
+                        break;
+                    }
+                }
+            } else if let Some(&'*') = chars.peek() {
+                chars.next();
+                while let Some(next_c) = chars.next() {
+                    if next_c == '\n' {
+                        res.push('\n');
+                    } else if next_c == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        res.push(' ');
+                        break;
+                    }
+                }
+            } else {
+                res.push(c);
+            }
+        } else if c == '"' {
+            res.push(c);
+            let mut escape = false;
+            while let Some(next_c) = chars.next() {
+                res.push(next_c);
+                if escape {
+                    escape = false;
+                } else if next_c == '\\' {
+                    escape = true;
+                } else if next_c == '"' {
+                    break;
+                }
+            }
+        } else if c == '\'' {
+            res.push(c);
+            let mut escape = false;
+            while let Some(next_c) = chars.next() {
+                res.push(next_c);
+                if escape {
+                    escape = false;
+                } else if next_c == '\\' {
+                    escape = true;
+                } else if next_c == '\'' {
+                    break;
+                }
+            }
+        } else {
+            res.push(c);
+        }
+    }
+    res
 }
 
 /// Read the declared Java version from this pom or its parent poms.
@@ -288,10 +351,11 @@ fn find_main_class(dir: &Path) -> Option<String> {
             let Ok(raw) = fs::read_to_string(entry.path()) else {
                 continue;
             };
-            if !raw.contains("@SpringBootApplication") {
+            let code = strip_comments(&raw);
+            if !code.contains("@SpringBootApplication") {
                 continue;
             }
-            let package = raw
+            let package = code
                 .lines()
                 .find_map(|l| {
                     l.trim()

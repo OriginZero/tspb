@@ -1575,3 +1575,41 @@ fn bare_z_in_panes_zooms_the_highlighted_window() {
     assert_eq!(app.zoom, Some(Focus::Log));
     assert_eq!(app.layer, Layer::Panes, "zooming does not enter the pane");
 }
+
+#[test]
+fn strip_comments_handles_lines_blocks_and_quotes() {
+    use crate::scan::project::strip_comments;
+    assert_eq!(strip_comments("// hello\nworld"), "\nworld");
+    assert_eq!(strip_comments("/* block */hello"), " hello");
+    assert_eq!(
+        strip_comments("String url = \"http://localhost\";"),
+        "String url = \"http://localhost\";"
+    );
+    assert!(!strip_comments("// @SpringBootApplication\n").contains("@SpringBootApplication"));
+    assert!(!strip_comments("/*\n * @SpringBootApplication\n */").contains("@SpringBootApplication"));
+}
+
+#[test]
+fn commented_out_spring_boot_application_is_not_launchable() {
+    use std::fs;
+    let tmp = std::env::temp_dir().join(format!("tspb-commented-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let app = tmp.join("sub-module");
+    fs::create_dir_all(app.join("src/main/java/demo")).unwrap();
+    fs::write(app.join("pom.xml"), "<project><groupId>org.example</groupId></project>").unwrap();
+    fs::write(
+        app.join("src/main/java/demo/CommentedApplication.java"),
+        "//package demo;\n//@SpringBootApplication\n//public class CommentedApplication {}\n",
+    )
+    .unwrap();
+
+    let cfg = Config {
+        scan_roots: vec![tmp.clone()],
+        max_depth: 3,
+        strict_roots: true,
+        ..Default::default()
+    };
+    let found = crate::scan::project::scan(&cfg, &[], &crate::progress::Reporter::silent());
+    assert!(found.is_empty(), "commented-out application must not be discovered");
+    let _ = fs::remove_dir_all(&tmp);
+}
