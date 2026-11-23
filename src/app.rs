@@ -312,6 +312,31 @@ impl App {
         // Managed processes started by this TUI first (they are the freshest state).
         if show_running {
             for m in self.runner.managed.values() {
+                let ports = self
+                    .inv
+                    .running
+                    .iter()
+                    .find_map(|a| {
+                        let is_match = a.pid == m.pid
+                            || (self
+                                .match_project(&a.main_class)
+                                .is_some_and(|pi| self.inv.projects[pi].path == m.project_path))
+                            || a.work_dir.as_deref() == Some(&m.project_path);
+                        if is_match && !a.ports.is_empty() {
+                            Some(format!(
+                                " · :{}",
+                                a.ports
+                                    .iter()
+                                    .map(u16::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+
                 rows.push(Row {
                     kind: RowKind::App {
                         project: self
@@ -325,11 +350,21 @@ impl App {
                     label: m.label.clone(),
                     origin: Origin::Idea,
                     state: m.state,
-                    detail: format!("pid {} · started {} · managed", m.pid, m.started_at),
+                    detail: format!("pid {} · started {} · managed{}", m.pid, m.started_at, ports),
                 });
             }
             for a in &self.inv.running {
                 if self.runner.find_by_pid(a.pid).is_some() {
+                    continue;
+                }
+                // Skip if this Java app is already managed by an active runner process
+                if self.runner.managed.values().any(|m| {
+                    matches!(m.state, RunState::Starting | RunState::Running)
+                        && (self
+                            .match_project(&a.main_class)
+                            .is_some_and(|pi| self.inv.projects[pi].path == m.project_path)
+                            || a.work_dir.as_deref() == Some(&m.project_path))
+                }) {
                     continue;
                 }
                 let ports = if a.ports.is_empty() {
@@ -959,7 +994,7 @@ impl App {
             }
         } else {
             for id in self.runner.managed.keys().cloned().collect::<Vec<_>>() {
-                let _ = self.runner.stop(&id);
+                let _ = self.stop_managed(&id);
             }
             self.should_quit = true;
         }
@@ -1371,6 +1406,26 @@ impl App {
         }
     }
 
+    pub fn stop_managed(&mut self, id: &str) -> Result<()> {
+        let matched_java_pid = if let Some(m) = self.runner.managed.get(id) {
+            self.inv.running.iter().find_map(|a| {
+                let matches = a.pid == m.pid
+                    || (self
+                        .match_project(&a.main_class)
+                        .is_some_and(|pi| self.inv.projects[pi].path == m.project_path))
+                    || a.work_dir.as_deref() == Some(&m.project_path);
+                if matches { Some(a.pid) } else { None }
+            })
+        } else {
+            None
+        };
+        let res = self.runner.stop(id);
+        if let Some(jpid) = matched_java_pid {
+            let _ = Runner::stop_external(jpid);
+        }
+        res
+    }
+
     fn stop_selected(&mut self) {
         let Some(row) = self.current_row().cloned() else {
             return;
@@ -1385,10 +1440,15 @@ impl App {
         };
         if let Some(m) = self.runner.find_by_pid(pid) {
             let id = m.id.clone();
-            match self.runner.stop(&id) {
+            let was_dead = matches!(m.state, RunState::Failed | RunState::Exited);
+            match self.stop_managed(&id) {
                 Ok(()) => {
                     self.selected_log_id = None;
-                    self.message = format!("stopped {id}");
+                    self.message = if was_dead {
+                        format!("dismissed {id}")
+                    } else {
+                        format!("stopped {id}")
+                    };
                     self.refresh_processes();
                 }
                 Err(e) => self.message = format!("stop failed: {e}"),
@@ -1415,7 +1475,7 @@ impl App {
         if let Some(pid) = pid {
             if let Some(m) = self.runner.find_by_pid(pid) {
                 let id = m.id.clone();
-                let _ = self.runner.stop(&id);
+                let _ = self.stop_managed(&id);
             } else {
                 self.message = "externally started process - stop it first (s)".into();
                 return;

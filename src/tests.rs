@@ -1613,3 +1613,55 @@ fn commented_out_spring_boot_application_is_not_launchable() {
     assert!(found.is_empty(), "commented-out application must not be discovered");
     let _ = fs::remove_dir_all(&tmp);
 }
+
+#[cfg(windows)]
+#[test]
+fn managed_app_deduplicates_scanned_java_process_and_inherits_ports() {
+    let jdk = Jdk {
+        name: "test-jdk".into(),
+        home: std::env::temp_dir(),
+        version: "17".into(),
+        java: PathBuf::from("java.exe"),
+        origin: Origin::Env,
+    };
+    let mut runner = Runner::new(200);
+    let script = "@echo off\r\necho Started DemoApplication in 1.23 seconds\r\nping -n 30 127.0.0.1 >nul\r\n";
+    let (project, id) = fake_service_script("svc-dedup", script, &jdk, &mut runner);
+    let tmp = project.path.clone();
+    wait_for_line(&mut runner, &id, "Started DemoApplication");
+    runner.poll();
+
+    let mut app = test_app();
+    let proj_path = project.path.clone();
+    app.inv.projects.push(project);
+    app.runner = runner;
+    // Add a simulated unmanaged system Java process matching this project
+    app.inv.running = vec![RunningApp {
+        pid: 99999,
+        main_class: "com.example.DemoApplication".into(),
+        name: "DemoApplication".into(),
+        jdk_home: None,
+        work_dir: Some(proj_path),
+        ports: vec![8080],
+        cmdline: "java com.example.DemoApplication".into(),
+        managed: false,
+        origin: Origin::System,
+    }];
+    app.rebuild_rows();
+
+    // Verify there is ONLY ONE RUNNING row (the managed one, with port 8080 attached)
+    let running_rows: Vec<_> = app.rows.iter().filter(|r| r.group == "RUNNING").collect();
+    assert_eq!(
+        running_rows.len(),
+        1,
+        "scanned Java process must be deduplicated when managed: {running_rows:?}"
+    );
+    assert!(
+        running_rows[0].detail.contains(":8080"),
+        "managed row should display detected ports: {}",
+        running_rows[0].detail
+    );
+
+    let _ = app.stop_managed(&id);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
