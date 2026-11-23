@@ -1665,3 +1665,117 @@ fn managed_app_deduplicates_scanned_java_process_and_inherits_ports() {
     let _ = app.stop_managed(&id);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn unmanaged_running_app_discovers_log_file_and_streams_it() {
+    use std::fs;
+    let tmp = std::env::temp_dir().join(format!("tspb-unmanaged-log-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let app_dir = tmp.join("server-module").join("demo-app-start");
+    let logs_dir = tmp.join("server-module").join("logs");
+    fs::create_dir_all(app_dir.join("src/main/resources")).unwrap();
+    fs::create_dir_all(&logs_dir).unwrap();
+
+    let logback = r#"<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <property name="LOG_HOME" value="../logs" />
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <FileNamePattern>${LOG_HOME}/demo-app-%d{yyyy-MM-dd}.%i.log</FileNamePattern>
+        </rollingPolicy>
+    </appender>
+</configuration>
+"#;
+    fs::write(
+        app_dir.join("src/main/resources/logback-spring.xml"),
+        logback,
+    )
+    .unwrap();
+    let log_file = logs_dir.join("demo-app-2026-11-23.0.log");
+    fs::write(
+        &log_file,
+        "Line 1: 2026-11-23 INFO Bootstrapping\nLine 2: 2026-11-23 INFO Started DemoAppApplication in 2.34s\n",
+    )
+    .unwrap();
+
+    let project = Project {
+        name: "demo-app-start".into(),
+        path: app_dir.clone(),
+        build: BuildTool::Maven,
+        has_wrapper: false,
+        main_class: Some("com.example.DemoAppApplication".into()),
+        java_version: Some(17),
+        launch_configs: vec![],
+        origin: Origin::Project,
+    };
+
+    let mut app = test_app();
+    app.inv.projects.clear();
+    app.inv.running.clear();
+    app.cfg.scan_roots = vec![tmp.clone()];
+    app.inv.projects.push(project);
+    app.inv.running.push(RunningApp {
+        pid: 12345,
+        main_class: "com.example.DemoAppApplication".into(),
+        name: "DemoAppApplication".into(),
+        jdk_home: None,
+        work_dir: Some(app_dir),
+        ports: vec![8080],
+        cmdline: "java com.example.DemoAppApplication".into(),
+        managed: false,
+        origin: Origin::System,
+    });
+    app.rebuild_rows();
+
+    // Select the running unmanaged app row
+    let running_idx = app
+        .rows
+        .iter()
+        .position(|r| r.group == "RUNNING" && r.label == "DemoAppApplication")
+        .expect("must have RUNNING row for DemoAppApplication");
+    app.selected = running_idx;
+
+    let log_id = app
+        .current_log_id()
+        .expect("must find log stream for unmanaged app");
+    assert!(
+        log_id.starts_with("file://"),
+        "must be file log stream: {log_id}"
+    );
+    assert!(
+        log_id.contains("demo-app-2026-11-23.0.log"),
+        "must point to demo-app log file: {log_id}"
+    );
+
+    let logs = app.logs_for(&log_id);
+    assert_eq!(logs.len(), 2);
+    assert!(logs[1].contains("Started DemoAppApplication"));
+
+    // Tick should update file_logs and keep following
+    app.tick();
+    assert_eq!(app.log_len_of(&log_id), 2);
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn read_file_tail_reads_tail_within_limit() {
+    use std::fs;
+    let tmp = std::env::temp_dir().join(format!("tspb-tail-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+    let file = tmp.join("test.log");
+
+    let content = (0..50)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&file, content).unwrap();
+
+    let tail = crate::scan::project::read_file_tail(&file, 10).unwrap();
+    assert_eq!(tail.len(), 10);
+    assert_eq!(tail[0], "line 40");
+    assert_eq!(tail[9], "line 49");
+
+    let _ = fs::remove_dir_all(&tmp);
+}

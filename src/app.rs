@@ -7,6 +7,7 @@ use anyhow::Result;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +102,14 @@ pub struct LineEntry {
     pub group: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct FileLogState {
+    pub path: PathBuf,
+    pub last_read: Instant,
+    pub last_len: u64,
+    pub lines: Vec<String>,
+}
+
 pub struct App {
     pub cfg: Config,
     pub inv: Inventory,
@@ -129,6 +138,7 @@ pub struct App {
     pub active_maven: usize,
     pub active_config: HashMap<String, usize>,
     pub selected_log_id: Option<String>,
+    pub file_logs: HashMap<String, FileLogState>,
     pub log_follow: bool,
     pub log_scroll: usize,
     /// Absolute index of the yank/scroll cursor inside the log ring buffer.
@@ -199,6 +209,7 @@ impl App {
             active_maven: 0,
             active_config: HashMap::new(),
             selected_log_id: None,
+            file_logs: HashMap::new(),
             log_follow: true,
             log_scroll: 0,
             log_cursor: 0,
@@ -582,6 +593,36 @@ impl App {
             .unwrap_or_else(|| "-".into())
     }
 
+    pub fn find_log_file_for_row(&self, row: &Row) -> Option<PathBuf> {
+        let (project, pid) = match row.kind {
+            RowKind::App { project, pid } => (project, pid),
+            _ => return None,
+        };
+        let running_app = pid.and_then(|p| self.inv.running.iter().find(|a| a.pid == p));
+        let project_obj = project.and_then(|pi| self.inv.projects.get(pi));
+
+        let project_path = project_obj.map(|p| p.path.as_path());
+        let project_name = project_obj.map(|p| p.name.as_str());
+        let main_class = running_app
+            .map(|a| a.main_class.as_str())
+            .or_else(|| project_obj.and_then(|p| p.main_class.as_deref()));
+        let app_name = running_app
+            .map(|a| a.name.as_str())
+            .or_else(|| project_obj.map(|p| p.name.as_str()));
+        let work_dir = running_app.and_then(|a| a.work_dir.as_deref());
+        let cmdline = running_app.map(|a| a.cmdline.as_str());
+
+        crate::scan::project::find_log_file(
+            project_path,
+            project_name,
+            main_class,
+            app_name,
+            work_dir,
+            cmdline,
+            &self.cfg.scan_roots,
+        )
+    }
+
     /// The stream the LOG pane renders. The selected row wins, so moving the
     /// cursor over a RUNNING entry switches the pane immediately; the pid match
     /// keeps two launch configs of the same module apart. `selected_log_id` is
@@ -589,21 +630,55 @@ impl App {
     /// which keeps the pane from blanking out while you browse toolchains.
     pub fn current_log_id(&self) -> Option<String> {
         let from_row = self.current_row().and_then(|row| match row.kind {
-            RowKind::App { project, pid } => pid
-                .and_then(|pid| self.runner.find_by_pid(pid))
-                .map(|m| m.id.clone())
-                .or_else(|| {
-                    project
-                        .and_then(|pi| self.runner.find_by_project(&self.inv.projects[pi].path))
-                        .map(|m| m.id.clone())
-                }),
+            RowKind::App { project, pid } => {
+                if let Some(pid) = pid {
+                    if let Some(m) = self.runner.find_by_pid(pid) {
+                        return Some(m.id.clone());
+                    }
+                }
+                if let Some(pi) = project {
+                    if let Some(m) = self.runner.find_by_project(&self.inv.projects[pi].path) {
+                        return Some(m.id.clone());
+                    }
+                }
+                self.find_log_file_for_row(row)
+                    .map(|p| format!("file://{}", p.display()))
+            }
             _ => None,
         });
         from_row.or_else(|| {
             self.selected_log_id
                 .clone()
-                .filter(|id| self.runner.managed.contains_key(id))
+                .filter(|id| self.runner.managed.contains_key(id) || id.starts_with("file://"))
         })
+    }
+
+    pub fn logs_for(&self, id: &str) -> Vec<String> {
+        if let Some(path_str) = id.strip_prefix("file://") {
+            if let Some(state) = self.file_logs.get(id) {
+                return state.lines.clone();
+            }
+            let path = Path::new(path_str);
+            if let Ok(lines) = crate::scan::project::read_file_tail(path, 2000) {
+                return lines;
+            }
+            return Vec::new();
+        }
+        self.runner.logs_for(id)
+    }
+
+    pub fn log_len_of(&self, id: &str) -> usize {
+        if let Some(path_str) = id.strip_prefix("file://") {
+            if let Some(state) = self.file_logs.get(id) {
+                return state.lines.len();
+            }
+            let path = Path::new(path_str);
+            if let Ok(lines) = crate::scan::project::read_file_tail(path, 2000) {
+                return lines.len();
+            }
+            return 0;
+        }
+        self.runner.log_len(id)
     }
 
     // ---------------------------------------------------------------- actions
@@ -1161,7 +1236,7 @@ impl App {
 
     fn log_len(&self) -> usize {
         self.current_log_id()
-            .map(|id| self.runner.log_len(&id))
+            .map(|id| self.log_len_of(&id))
             .unwrap_or(0)
     }
 
@@ -1251,7 +1326,6 @@ impl App {
         // The buffer holds the raw stream; the clipboard gets what a terminal
         // would have shown, without colour codes.
         let lines: Vec<String> = self
-            .runner
             .logs_for(&id)
             .iter()
             .map(|l| crate::runner::plain_text(l))
@@ -1506,8 +1580,47 @@ impl App {
         self.rebuild_rows();
     }
 
+    fn poll_file_logs(&mut self) {
+        let Some(id) = self.current_log_id() else {
+            return;
+        };
+        let Some(path_str) = id.strip_prefix("file://") else {
+            return;
+        };
+        let now = Instant::now();
+        let (should_read, path) = match self.file_logs.get(&id) {
+            Some(state) => {
+                let should = if state.last_read.elapsed() >= Duration::from_millis(250) {
+                    let current_len = std::fs::metadata(&state.path).map(|m| m.len()).unwrap_or(0);
+                    current_len != state.last_len
+                        || state.last_read.elapsed() >= Duration::from_secs(2)
+                } else {
+                    false
+                };
+                (should, state.path.clone())
+            }
+            None => (true, PathBuf::from(path_str)),
+        };
+
+        if should_read {
+            if let Ok(lines) = crate::scan::project::read_file_tail(&path, 2000) {
+                let current_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                self.file_logs.insert(
+                    id.clone(),
+                    FileLogState {
+                        path,
+                        last_read: now,
+                        last_len: current_len,
+                        lines,
+                    },
+                );
+            }
+        }
+    }
+
     pub fn tick(&mut self) {
         self.runner.poll();
+        self.poll_file_logs();
         self.sync_log_target();
         // While following the tail, every new line scrolls into view. An app
         // that is logging hard must not leave the cursor stranded mid-buffer.

@@ -385,27 +385,55 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, app: &App) {
     // Same source the LOG pane renders from, so DETAIL can never disagree with
     // the stream below it (two configs of one module are told apart by pid).
     let live = app.current_log_id().map(|id| {
-        (
-            app.runner.managed.get(&id).map(|m| m.pid).unwrap_or(0),
-            app.runner.log_len(&id),
-        )
+        if id.starts_with("file://") {
+            let pid = app
+                .current_row()
+                .and_then(|r| match r.kind {
+                    RowKind::App { pid: Some(p), .. } => Some(p),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            (pid, app.log_len_of(&id), Some(id))
+        } else {
+            (
+                app.runner.managed.get(&id).map(|m| m.pid).unwrap_or(0),
+                app.log_len_of(&id),
+                None,
+            )
+        }
     });
     let log_line = match live {
-        Some((pid, lines)) => Line::from(vec![
-            Span::styled(" LIVE LOG  ", Style::default().fg(DIM)),
-            Span::styled(
-                format!("pid {pid}  {lines} lines  "),
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::styled(
-                if app.log_follow { "FOLLOW" } else { "SCROLL" },
-                Style::default().fg(if app.log_follow {
-                    Color::Green
-                } else {
-                    Color::Yellow
-                }),
-            ),
-        ]),
+        Some((pid, lines, maybe_file)) => {
+            let file_desc = if let Some(fid) = maybe_file {
+                let fname = std::path::Path::new(&fid["file://".len()..])
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "file".to_string());
+                format!("(file: {fname})  ")
+            } else {
+                String::new()
+            };
+            let pid_desc = if pid > 0 {
+                format!("pid {pid}  ")
+            } else {
+                String::new()
+            };
+            Line::from(vec![
+                Span::styled(" LIVE LOG  ", Style::default().fg(DIM)),
+                Span::styled(
+                    format!("{pid_desc}{file_desc}{lines} lines  "),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    if app.log_follow { "FOLLOW" } else { "SCROLL" },
+                    Style::default().fg(if app.log_follow {
+                        Color::Green
+                    } else {
+                        Color::Yellow
+                    }),
+                ),
+            ])
+        }
         None => Line::from(vec![
             Span::styled(" LIVE LOG  ", Style::default().fg(DIM)),
             Span::styled("no stream for this row", Style::default().fg(DIM)),
@@ -510,12 +538,27 @@ fn render_log(f: &mut Frame<'_>, area: Rect, app: &App) {
     let mut total = 0usize;
 
     if let Some(id) = &id {
-        let raw = app.runner.logs_for(id);
+        let raw = app.logs_for(id);
         total = raw.len();
-        title = format!(
-            " LOG  pid {} ",
-            app.runner.managed.get(id).map(|m| m.pid).unwrap_or(0)
-        );
+        if id.starts_with("file://") {
+            let filename = std::path::Path::new(&id["file://".len()..])
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "file".to_string());
+            let pid_str = app
+                .current_row()
+                .and_then(|r| match r.kind {
+                    RowKind::App { pid: Some(p), .. } => Some(format!("pid {p} ")),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            title = format!(" LOG  {pid_str}[{filename}] ");
+        } else {
+            title = format!(
+                " LOG  pid {} ",
+                app.runner.managed.get(id).map(|m| m.pid).unwrap_or(0)
+            );
+        }
         let content_width = area.width.saturating_sub(2).max(1) as usize;
         let start = if app.log_follow {
             let mut budget = height;
@@ -578,7 +621,7 @@ fn render_log(f: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(Color::Yellow),
             )));
             lines.push(Line::from(Span::styled(
-                "Its stdout/stderr belongs to that JVM's console and cannot be captured here.",
+                "No log file was found for this application. Its stdout/stderr belongs to that JVM's console.",
                 Style::default().fg(DIM),
             )));
             lines.push(Line::from(Span::styled(

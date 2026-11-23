@@ -220,7 +220,6 @@ fn looks_like_spring_boot(raw: &str, dir: &Path) -> bool {
         })
 }
 
-
 /// Strip single-line `//` and multi-line `/* */` comments from Java/Kotlin source,
 /// respecting string literals.
 pub(crate) fn strip_comments(code: &str) -> String {
@@ -536,6 +535,460 @@ fn parse_run_xml(path: &Path, out: &mut Vec<LaunchConfig>) {
 fn attr(e: &quick_xml::events::BytesStart<'_>, key: &str) -> Option<String> {
     e.attributes()
         .flatten()
-        .find(|a| a.key.as_ref() == key)
+        .find(|a| a.key.as_ref().eq_ignore_ascii_case(key))
         .map(|a| crate::scan::unescape_xml(a.value.as_ref()))
+}
+
+/// Read up to `max_lines` from the tail of a log file, reading at most the last 2MB.
+pub fn read_file_tail(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>> {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = File::open(path)?;
+    let metadata = file.metadata()?;
+    let len = metadata.len();
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+
+    const MAX_BYTES: u64 = 2 * 1024 * 1024;
+    let seek_pos = len.saturating_sub(MAX_BYTES);
+    if seek_pos > 0 {
+        file.seek(SeekFrom::Start(seek_pos))?;
+    }
+
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+
+    if seek_pos > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+
+    let count = lines.len();
+    let skip = count.saturating_sub(max_lines);
+    Ok(lines.into_iter().skip(skip).map(String::from).collect())
+}
+
+/// Discover the most relevant active log file for a running application or project.
+pub fn find_log_file(
+    project_path: Option<&Path>,
+    project_name: Option<&str>,
+    main_class: Option<&str>,
+    app_name: Option<&str>,
+    work_dir: Option<&Path>,
+    cmdline: Option<&str>,
+    scan_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut prefixes: Vec<String> = Vec::new();
+
+    // 1. Check project configuration files (logback, log4j2, application.yml)
+    if let Some(p) = project_path {
+        let res_dir = p.join("src").join("main").join("resources");
+        for dir in [&res_dir, p] {
+            if !dir.is_dir() {
+                continue;
+            }
+            // Logback / Log4j XML
+            for name in ["logback-spring.xml", "logback.xml", "log4j2-spring.xml", "log4j2.xml"] {
+                let xml_file = dir.join(name);
+                if let Ok(raw) = fs::read_to_string(&xml_file) {
+                    extract_logback_info(&raw, p, &mut dirs, &mut prefixes);
+                }
+            }
+            // Spring Boot YAML / Properties
+            for name in ["application.yml", "application.yaml", "application.properties"] {
+                let cfg_file = dir.join(name);
+                if let Ok(raw) = fs::read_to_string(&cfg_file) {
+                    extract_spring_config_log_info(&raw, p, &mut dirs, &mut prefixes);
+                }
+            }
+        }
+    }
+
+    // 2. JVM command line arguments (e.g. -Dlogging.file.name, -DLOG_HOME)
+    if let Some(cmd) = cmdline {
+        extract_cmdline_log_info(cmd, project_path, &mut dirs, &mut prefixes);
+    }
+
+    // 3. Conventional directory locations
+    if let Some(p) = project_path {
+        dirs.push(p.join("logs"));
+        dirs.push(p.join("log"));
+        dirs.push(p.to_path_buf());
+        for ancestor in p.ancestors().skip(1).take(3) {
+            dirs.push(ancestor.join("logs"));
+            dirs.push(ancestor.join("log"));
+        }
+    }
+    if let Some(w) = work_dir {
+        dirs.push(w.join("logs"));
+        dirs.push(w.join("log"));
+        dirs.push(w.to_path_buf());
+    }
+    for root in scan_roots {
+        dirs.push(root.join("logs"));
+        dirs.push(root.join("log"));
+    }
+
+    // Collect name tokens
+    let mut tokens: Vec<String> = Vec::new();
+    if let Some(mc) = main_class {
+        let short = mc.rsplit('.').next().unwrap_or(mc);
+        for w in split_words(short) {
+            if w.len() >= 3 && !tokens.contains(&w) {
+                tokens.push(w);
+            }
+        }
+    }
+    if let Some(pn) = project_name {
+        for w in split_words(pn) {
+            if w.len() >= 3 && !tokens.contains(&w) {
+                tokens.push(w);
+            }
+        }
+        prefixes.push(pn.to_lowercase());
+    }
+    if let Some(an) = app_name {
+        for w in split_words(an) {
+            if w.len() >= 3 && !tokens.contains(&w) {
+                tokens.push(w);
+            }
+        }
+        prefixes.push(an.to_lowercase());
+    }
+
+    // Filter and deduplicate existing candidate directories
+    let mut checked_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut valid_dirs: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        if let Ok(canon) = d.canonicalize() {
+            if canon.is_dir() && checked_dirs.insert(canon.clone()) {
+                valid_dirs.push(canon);
+            }
+        } else if d.is_dir() && checked_dirs.insert(d.clone()) {
+            valid_dirs.push(d);
+        }
+    }
+
+    // Scan candidate directories for log files
+    struct Candidate {
+        path: PathBuf,
+        score: i64,
+        modified: std::time::SystemTime,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
+
+    for d in valid_dirs {
+        let Ok(entries) = fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(cand) = score_log_file(&path, &entry, &tokens, &prefixes) {
+                    candidates.push(Candidate {
+                        path: cand.0,
+                        score: cand.1,
+                        modified: cand.2,
+                    });
+                }
+            } else if path.is_dir() {
+                // Check 1 level of subdirectories if folder name relates to app/logs
+                let dname = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase();
+                let matches_dir = tokens.iter().any(|t| dname.contains(t))
+                    || prefixes.iter().any(|p| dname.contains(p));
+                if matches_dir {
+                    if let Ok(sub_entries) = fs::read_dir(&path) {
+                        for sub in sub_entries.flatten() {
+                            let sub_path = sub.path();
+                            if sub_path.is_file() {
+                                if let Some(cand) = score_log_file(&sub_path, &sub, &tokens, &prefixes) {
+                                    candidates.push(Candidate {
+                                        path: cand.0,
+                                        score: cand.1,
+                                        modified: cand.2,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.modified.cmp(&a.modified)));
+    candidates.first().filter(|c| c.score > 0).map(|c| c.path.clone())
+}
+
+fn score_log_file(
+    path: &Path,
+    entry: &fs::DirEntry,
+    tokens: &[String],
+    prefixes: &[String],
+) -> Option<(PathBuf, i64, std::time::SystemTime)> {
+    let fname = path.file_name()?.to_string_lossy().to_lowercase();
+    if !fname.ends_with(".log")
+        && !fname.ends_with(".out")
+        && !fname.ends_with(".txt")
+        && !fname.contains(".log.")
+    {
+        return None;
+    }
+    let mut score = 0i64;
+
+    // Check prefix matches
+    for prefix in prefixes {
+        if !prefix.is_empty() && fname.contains(prefix) {
+            score += 60;
+            break;
+        }
+    }
+
+    // Check token matches
+    for token in tokens {
+        if fname.contains(token) {
+            if ["application", "start", "server", "boot", "service", "main"]
+                .contains(&token.as_str())
+            {
+                score += 5;
+            } else {
+                score += 25;
+            }
+        }
+    }
+
+    let meta = entry.metadata().ok()?;
+    let len = meta.len();
+    if len == 0 {
+        score -= 20;
+    } else {
+        score += 10;
+    }
+
+    let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    if let Ok(elapsed) = modified.elapsed() {
+        let secs = elapsed.as_secs();
+        if secs < 600 {
+            score += 50;
+        } else if secs < 3600 * 2 {
+            score += 35;
+        } else if secs < 3600 * 24 {
+            score += 20;
+        } else if secs < 3600 * 24 * 7 {
+            score += 0;
+        } else {
+            score -= 60;
+        }
+    }
+
+    Some((path.to_path_buf(), score, modified))
+}
+
+fn split_words(s: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for c in s.chars() {
+        if c == '-' || c == '_' || c == '.' || c == '/' || c == '\\' {
+            if !current.is_empty() {
+                words.push(current.to_lowercase());
+                current.clear();
+            }
+        } else if c.is_uppercase()
+            && !current.is_empty()
+            && current.chars().last().is_some_and(|l| l.is_lowercase())
+        {
+            words.push(current.to_lowercase());
+            current.clear();
+            current.push(c);
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        words.push(current.to_lowercase());
+    }
+    words
+}
+
+fn extract_logback_info(
+    raw: &str,
+    project_dir: &Path,
+    dirs: &mut Vec<PathBuf>,
+    prefixes: &mut Vec<String>,
+) {
+    let mut reader = Reader::from_str(raw);
+    reader.config_mut().trim_text(true);
+    let mut properties: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut current_tag = String::new();
+
+    while let Ok(event) = reader.read_event() {
+        match event {
+            Event::Start(e) | Event::Empty(e) => {
+                let qname = e.name();
+                let tag = qname.as_ref();
+                if tag.eq_ignore_ascii_case("property") {
+                    let name = attr(&e, "name").unwrap_or_default();
+                    let mut val = attr(&e, "value").unwrap_or_default();
+                    if !name.is_empty() && !val.is_empty() {
+                        for (pk, pv) in &properties {
+                            let placeholder = format!("${{{pk}}}");
+                            if val.contains(&placeholder) {
+                                val = val.replace(&placeholder, pv);
+                            }
+                        }
+                        properties.insert(name.clone(), val.clone());
+                        let name_lower = name.to_lowercase();
+                        if name_lower.contains("log")
+                            || name_lower.contains("dir")
+                            || name_lower.contains("path")
+                        {
+                            let p = Path::new(&val);
+                            let resolved = if p.is_relative() {
+                                project_dir.join(p)
+                            } else {
+                                p.to_path_buf()
+                            };
+                            dirs.push(resolved);
+                        }
+                    }
+                }
+                current_tag = tag.to_string();
+            }
+            Event::Text(t) => {
+                let tag_lower = current_tag.to_lowercase();
+                if tag_lower == "file" || tag_lower.contains("filenamepattern") {
+                    let mut text = t.as_ref().to_string();
+                    for (pk, pv) in &properties {
+                        let placeholder = format!("${{{pk}}}");
+                        if text.contains(&placeholder) {
+                            text = text.replace(&placeholder, pv);
+                        }
+                    }
+                    if !text.is_empty() {
+                        let p = Path::new(&text);
+                        if let Some(parent) = p.parent() {
+                            if !parent.as_os_str().is_empty() {
+                                let resolved = if parent.is_relative() {
+                                    project_dir.join(parent)
+                                } else {
+                                    parent.to_path_buf()
+                                };
+                                dirs.push(resolved);
+                            }
+                        }
+                        if let Some(fname) = p.file_name().and_then(|f| f.to_str()) {
+                            let clean = fname
+                                .split('%')
+                                .next()
+                                .unwrap_or(fname)
+                                .trim_matches(['-', '_', '.']);
+                            if clean.len() >= 3 {
+                                prefixes.push(clean.to_lowercase());
+                            }
+                        }
+                    }
+                }
+            }
+            Event::End(_) => {
+                current_tag.clear();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+}
+
+fn extract_spring_config_log_info(
+    raw: &str,
+    project_dir: &Path,
+    dirs: &mut Vec<PathBuf>,
+    prefixes: &mut Vec<String>,
+) {
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = trimmed.split_once(':') {
+            let k = k.trim();
+            let v = v.trim().trim_matches('"').trim_matches('\'');
+            if v.is_empty() {
+                continue;
+            }
+            if (k == "name" && trimmed.contains("application")) || k == "spring.application.name" {
+                prefixes.push(v.to_lowercase());
+            } else if k == "logging.file.name" || k == "logging.file" {
+                let p = Path::new(v);
+                if let Some(parent) = p.parent() {
+                    let resolved = if parent.is_relative() {
+                        project_dir.join(parent)
+                    } else {
+                        parent.to_path_buf()
+                    };
+                    dirs.push(resolved);
+                }
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    prefixes.push(stem.to_lowercase());
+                }
+            } else if k == "logging.file.path" || k == "logging.path" || k == "log.path" {
+                let p = Path::new(v);
+                let resolved = if p.is_relative() {
+                    project_dir.join(p)
+                } else {
+                    p.to_path_buf()
+                };
+                dirs.push(resolved);
+            }
+        }
+    }
+}
+
+fn extract_cmdline_log_info(
+    cmd: &str,
+    project_dir: Option<&Path>,
+    dirs: &mut Vec<PathBuf>,
+    prefixes: &mut Vec<String>,
+) {
+    for token in cmd.split_whitespace() {
+        let clean = token.trim_matches('"').trim_matches('\'');
+        for key in [
+            "-Dlogging.file.name=",
+            "-Dlogging.file=",
+            "-DLOG_PATH=",
+            "-DLOG_HOME=",
+            "-Dlogging.file.path=",
+        ] {
+            if let Some(val) = clean.strip_prefix(key) {
+                let p = Path::new(val);
+                if val.ends_with(".log") || val.ends_with(".out") || val.ends_with(".txt") {
+                    if let Some(parent) = p.parent() {
+                        let resolved = match (parent.is_relative(), project_dir) {
+                            (true, Some(base)) => base.join(parent),
+                            _ => parent.to_path_buf(),
+                        };
+                        dirs.push(resolved);
+                    }
+                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                        prefixes.push(stem.to_lowercase());
+                    }
+                } else {
+                    let resolved = match (p.is_relative(), project_dir) {
+                        (true, Some(base)) => base.join(p),
+                        _ => p.to_path_buf(),
+                    };
+                    dirs.push(resolved);
+                }
+            }
+        }
+    }
 }
