@@ -516,13 +516,34 @@ fn render_log(f: &mut Frame<'_>, area: Rect, app: &App) {
             " LOG  pid {} ",
             app.runner.managed.get(id).map(|m| m.pid).unwrap_or(0)
         );
+        let content_width = area.width.saturating_sub(2).max(1) as usize;
         let start = if app.log_follow {
-            total.saturating_sub(height)
+            let mut budget = height;
+            let mut s = total;
+            for (i, line) in raw.iter().enumerate().rev() {
+                let len = crate::runner::plain_text(line).chars().count() + 1;
+                let vrows = ((len + content_width - 1) / content_width).max(1);
+                if budget >= vrows {
+                    budget -= vrows;
+                    s = i;
+                } else {
+                    if s == total {
+                        s = i;
+                    }
+                    break;
+                }
+            }
+            s
         } else {
             app.log_scroll.min(total.saturating_sub(height))
         };
         let selection = app.log_selection();
-        for (offset, text) in raw.iter().skip(start).take(height).enumerate() {
+        let iter = if app.log_follow {
+            raw.iter().skip(start).take(total.saturating_sub(start))
+        } else {
+            raw.iter().skip(start).take(height)
+        };
+        for (offset, text) in iter.enumerate() {
             let abs = start + offset;
             // `ansi-to-tui` turns the app's own SGR codes into ratatui styles, so
             // Spring's INFO/WARN/ERROR colours survive. Lines without codes fall
