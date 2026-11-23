@@ -252,7 +252,7 @@ pub(crate) fn strip_comments(code: &str) -> String {
         } else if c == '"' {
             res.push(c);
             let mut escape = false;
-            while let Some(next_c) = chars.next() {
+            for next_c in chars.by_ref() {
                 res.push(next_c);
                 if escape {
                     escape = false;
@@ -265,7 +265,7 @@ pub(crate) fn strip_comments(code: &str) -> String {
         } else if c == '\'' {
             res.push(c);
             let mut escape = false;
-            while let Some(next_c) = chars.next() {
+            for next_c in chars.by_ref() {
                 res.push(next_c);
                 if escape {
                     escape = false;
@@ -593,14 +593,23 @@ pub fn find_log_file(
                 continue;
             }
             // Logback / Log4j XML
-            for name in ["logback-spring.xml", "logback.xml", "log4j2-spring.xml", "log4j2.xml"] {
+            for name in [
+                "logback-spring.xml",
+                "logback.xml",
+                "log4j2-spring.xml",
+                "log4j2.xml",
+            ] {
                 let xml_file = dir.join(name);
                 if let Ok(raw) = fs::read_to_string(&xml_file) {
                     extract_logback_info(&raw, p, &mut dirs, &mut prefixes);
                 }
             }
             // Spring Boot YAML / Properties
-            for name in ["application.yml", "application.yaml", "application.properties"] {
+            for name in [
+                "application.yml",
+                "application.yaml",
+                "application.properties",
+            ] {
                 let cfg_file = dir.join(name);
                 if let Ok(raw) = fs::read_to_string(&cfg_file) {
                     extract_spring_config_log_info(&raw, p, &mut dirs, &mut prefixes);
@@ -705,19 +714,17 @@ pub fn find_log_file(
                     .to_lowercase();
                 let matches_dir = tokens.iter().any(|t| dname.contains(t))
                     || prefixes.iter().any(|p| dname.contains(p));
-                if matches_dir {
-                    if let Ok(sub_entries) = fs::read_dir(&path) {
-                        for sub in sub_entries.flatten() {
-                            let sub_path = sub.path();
-                            if sub_path.is_file() {
-                                if let Some(cand) = score_log_file(&sub_path, &sub, &tokens, &prefixes) {
-                                    candidates.push(Candidate {
-                                        path: cand.0,
-                                        score: cand.1,
-                                        modified: cand.2,
-                                    });
-                                }
-                            }
+                if matches_dir && let Ok(sub_entries) = fs::read_dir(&path) {
+                    for sub in sub_entries.flatten() {
+                        let sub_path = sub.path();
+                        if sub_path.is_file()
+                            && let Some(cand) = score_log_file(&sub_path, &sub, &tokens, &prefixes)
+                        {
+                            candidates.push(Candidate {
+                                path: cand.0,
+                                score: cand.1,
+                                modified: cand.2,
+                            });
                         }
                     }
                 }
@@ -725,8 +732,15 @@ pub fn find_log_file(
         }
     }
 
-    candidates.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.modified.cmp(&a.modified)));
-    candidates.first().filter(|c| c.score > 0).map(|c| c.path.clone())
+    candidates.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| b.modified.cmp(&a.modified))
+    });
+    candidates
+        .first()
+        .filter(|c| c.score > 0)
+        .map(|c| c.path.clone())
 }
 
 fn score_log_file(
@@ -876,15 +890,15 @@ fn extract_logback_info(
                     }
                     if !text.is_empty() {
                         let p = Path::new(&text);
-                        if let Some(parent) = p.parent() {
-                            if !parent.as_os_str().is_empty() {
-                                let resolved = if parent.is_relative() {
-                                    project_dir.join(parent)
-                                } else {
-                                    parent.to_path_buf()
-                                };
-                                dirs.push(resolved);
-                            }
+                        if let Some(parent) = p.parent()
+                            && !parent.as_os_str().is_empty()
+                        {
+                            let resolved = if parent.is_relative() {
+                                project_dir.join(parent)
+                            } else {
+                                parent.to_path_buf()
+                            };
+                            dirs.push(resolved);
                         }
                         if let Some(fname) = p.file_name().and_then(|f| f.to_str()) {
                             let clean = fname

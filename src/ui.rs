@@ -540,8 +540,8 @@ fn render_log(f: &mut Frame<'_>, area: Rect, app: &App) {
     if let Some(id) = &id {
         let raw = app.logs_for(id);
         total = raw.len();
-        if id.starts_with("file://") {
-            let filename = std::path::Path::new(&id["file://".len()..])
+        if let Some(path_str) = id.strip_prefix("file://") {
+            let filename = std::path::Path::new(path_str)
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "file".to_string());
@@ -565,7 +565,7 @@ fn render_log(f: &mut Frame<'_>, area: Rect, app: &App) {
             let mut s = total;
             for (i, line) in raw.iter().enumerate().rev() {
                 let len = crate::runner::plain_text(line).chars().count() + 1;
-                let vrows = ((len + content_width - 1) / content_width).max(1);
+                let vrows = len.div_ceil(content_width).max(1);
                 if budget >= vrows {
                     budget -= vrows;
                     s = i;

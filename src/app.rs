@@ -361,7 +361,10 @@ impl App {
                     label: m.label.clone(),
                     origin: Origin::Idea,
                     state: m.state,
-                    detail: format!("pid {} · started {} · managed{}", m.pid, m.started_at, ports),
+                    detail: format!(
+                        "pid {} · started {} · managed{}",
+                        m.pid, m.started_at, ports
+                    ),
                 });
             }
             for a in &self.inv.running {
@@ -631,15 +634,15 @@ impl App {
     pub fn current_log_id(&self) -> Option<String> {
         let from_row = self.current_row().and_then(|row| match row.kind {
             RowKind::App { project, pid } => {
-                if let Some(pid) = pid {
-                    if let Some(m) = self.runner.find_by_pid(pid) {
-                        return Some(m.id.clone());
-                    }
+                if let Some(pid) = pid
+                    && let Some(m) = self.runner.find_by_pid(pid)
+                {
+                    return Some(m.id.clone());
                 }
-                if let Some(pi) = project {
-                    if let Some(m) = self.runner.find_by_project(&self.inv.projects[pi].path) {
-                        return Some(m.id.clone());
-                    }
+                if let Some(pi) = project
+                    && let Some(m) = self.runner.find_by_project(&self.inv.projects[pi].path)
+                {
+                    return Some(m.id.clone());
                 }
                 self.find_log_file_for_row(row)
                     .map(|p| format!("file://{}", p.display()))
@@ -1602,19 +1605,17 @@ impl App {
             None => (true, PathBuf::from(path_str)),
         };
 
-        if should_read {
-            if let Ok(lines) = crate::scan::project::read_file_tail(&path, 2000) {
-                let current_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                self.file_logs.insert(
-                    id.clone(),
-                    FileLogState {
-                        path,
-                        last_read: now,
-                        last_len: current_len,
-                        lines,
-                    },
-                );
-            }
+        if should_read && let Ok(lines) = crate::scan::project::read_file_tail(&path, 2000) {
+            let current_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            self.file_logs.insert(
+                id.clone(),
+                FileLogState {
+                    path,
+                    last_read: now,
+                    last_len: current_len,
+                    lines,
+                },
+            );
         }
     }
 

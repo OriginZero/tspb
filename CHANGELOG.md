@@ -4,6 +4,33 @@ All notable changes to tspb are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-11-23
+
+### Added
+
+- **Live log streaming for external applications.** `tspb` now automatically
+  locates active log files for applications started outside the TUI (e.g. from
+  IntelliJ IDEA). It inspects `logback-spring.xml` / `logback.xml` rolling file
+  patterns (`LOG_HOME`, `LOG_PATH`, `<FileNamePattern>`), Spring configuration
+  properties (`logging.file.name`, `logging.file.path`), and conventional `logs`
+  directories, scoring candidate files by name tokens and recency.
+- The LOG pane displays the matched log file badge (e.g. `[app.log]`), and
+  DETAIL reports the file name alongside live line counts.
+
+### Fixed
+
+- **Commented-out annotations are ignored during project scanning.** Comments
+  (`//` and `/* */`) in Java and Kotlin source files are stripped before checking
+  for `@SpringBootApplication`, preventing commented-out modules from being
+  mistakenly listed as runnable.
+- **Deduplicated managed applications.** Java processes launched by `tspb`
+  runner are deduplicated against system process scans and inherit detected
+  ports. Stopping a managed runner instance now cascades termination to child
+  JVM processes, and exited/failed runner rows can be cleanly dismissed.
+- **Log follow mode visual line wrapping.** In FOLLOW mode, the start line
+  index is now computed using visual terminal row budget calculated backwards
+  from the tail, ensuring wrapped lines do not push newest log output off-screen.
+
 ## [0.3.0] - 2026-11-13
 
 ### Added
@@ -52,4 +79,5 @@ All notable changes to tspb are recorded here. The format follows
 - `v0.1.1`, `v0.1.0` — first releases: environment/index scanning, one-key
   launch, live log capture, process-tree stop.
 
+[0.3.1]: https://github.com/OriginZero/tspb/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/OriginZero/tspb/compare/v0.2.0...v0.3.0

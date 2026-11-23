@@ -1586,7 +1586,9 @@ fn strip_comments_handles_lines_blocks_and_quotes() {
         "String url = \"http://localhost\";"
     );
     assert!(!strip_comments("// @SpringBootApplication\n").contains("@SpringBootApplication"));
-    assert!(!strip_comments("/*\n * @SpringBootApplication\n */").contains("@SpringBootApplication"));
+    assert!(
+        !strip_comments("/*\n * @SpringBootApplication\n */").contains("@SpringBootApplication")
+    );
 }
 
 #[test]
@@ -1596,7 +1598,11 @@ fn commented_out_spring_boot_application_is_not_launchable() {
     let _ = fs::remove_dir_all(&tmp);
     let app = tmp.join("sub-module");
     fs::create_dir_all(app.join("src/main/java/demo")).unwrap();
-    fs::write(app.join("pom.xml"), "<project><groupId>org.example</groupId></project>").unwrap();
+    fs::write(
+        app.join("pom.xml"),
+        "<project><groupId>org.example</groupId></project>",
+    )
+    .unwrap();
     fs::write(
         app.join("src/main/java/demo/CommentedApplication.java"),
         "//package demo;\n//@SpringBootApplication\n//public class CommentedApplication {}\n",
@@ -1610,7 +1616,10 @@ fn commented_out_spring_boot_application_is_not_launchable() {
         ..Default::default()
     };
     let found = crate::scan::project::scan(&cfg, &[], &crate::progress::Reporter::silent());
-    assert!(found.is_empty(), "commented-out application must not be discovered");
+    assert!(
+        found.is_empty(),
+        "commented-out application must not be discovered"
+    );
     let _ = fs::remove_dir_all(&tmp);
 }
 
