@@ -4,6 +4,46 @@ All notable changes to tspb are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-11-24
+
+### Added
+
+- **Confirmation prompt for stopping running services.** Pressing `s` (or `x`)
+  on any live service (whether started inside `tspb` or externally) now prompts
+  for confirmation before terminating its process tree; already exited/failed
+  entries are still dismissed immediately.
+- **IDEA `ALTERNATIVE_JRE_PATH` support.** IDEA run configurations with an
+  enabled alternative JRE are matched against discovered JDKs when no manual
+  or `--jdk` override is set.
+
+### Fixed
+
+- **Multi-module IDEA run configuration binding & deduplication.** `parse_run_xml`
+  now binds `<module name="..." />` entries to their target module and scopes
+  Maven/Gradle goal checks to each `<configuration>` block, preventing shared
+  main-class modules (e.g. Spring Cloud `-start` vs `-cloud-start` modules) or
+  parent aggregator POMs from inheriting another module's configuration.
+  `match_running_project` also disambiguates running processes across shared
+  main classes and `--wide` checkouts.
+- **Shared `logs` directory isolation & config parsing.** External log discovery
+  separates module-exclusive folders from shared `../logs` folders so sibling
+  services do not hijack each other's log files, avoids attaching file logs to
+  idle project rows, parses nested YAML (`spring.application.name`,
+  `logging.file.*`) and `.properties` (`=`) files, expands `${user.home}`, and
+  caches file lookups across UI frames.
+- **Clear stale logs after stopping services.** Stopping an external or managed
+  process—or an external process exiting on its own—now clears `selected_log_id`
+  and prunes stale `file://` cache entries instead of leaving old logs pinned.
+- **TUI JDK picker override.** Selecting a JDK in the TUI (`J` or `Enter` on a
+  JDK row) now overrides `<java.version>` auto-selection and accurately reports
+  the launched JDK in the status bar.
+- **Gradle wrapper, process detection & UI polish.** Gradle projects invoke
+  `gradlew`/`gradle` instead of `mvn`; process scanning recognizes Spring Boot
+  3.2+ `loader.launch.*` and `-jar` launches while stripping Windows `\\?\`
+  prefixes; `SCROLL` mode accounts for CJK display width and word wrapping;
+  scrolled list mouse clicks respect list offset; sidebar `Running`/`All` counts
+  include managed processes; reader threads get a brief flush window on exit.
+
 ## [0.3.1] - 2026-11-23
 
 ### Added
@@ -79,5 +119,6 @@ All notable changes to tspb are recorded here. The format follows
 - `v0.1.1`, `v0.1.0` — first releases: environment/index scanning, one-key
   launch, live log capture, process-tree stop.
 
+[0.3.2]: https://github.com/OriginZero/tspb/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/OriginZero/tspb/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/OriginZero/tspb/compare/v0.2.0...v0.3.0
