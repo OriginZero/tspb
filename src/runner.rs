@@ -5,8 +5,9 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -22,6 +23,8 @@ pub struct Managed {
     pub started_at: String,
     pub logs: LogBuf,
     started_flag: Arc<AtomicBool>,
+    active_readers: Arc<AtomicUsize>,
+    exited_at: Option<Instant>,
     child: Child,
 }
 
@@ -84,6 +87,7 @@ impl Runner {
         let pid = child.id();
         let logs: LogBuf = Arc::new(Mutex::new(VecDeque::with_capacity(self.capacity.min(4096))));
         let started_flag = Arc::new(AtomicBool::new(false));
+        let active_readers = Arc::new(AtomicUsize::new(0));
 
         push_line(
             &logs,
@@ -102,16 +106,26 @@ impl Runner {
         );
 
         if let Some(out) = child.stdout.take() {
+            active_readers.fetch_add(1, Ordering::AcqRel);
             spawn_reader(
                 out,
                 logs.clone(),
                 started_flag.clone(),
+                active_readers.clone(),
                 self.capacity,
                 false,
             );
         }
         if let Some(err) = child.stderr.take() {
-            spawn_reader(err, logs.clone(), started_flag.clone(), self.capacity, true);
+            active_readers.fetch_add(1, Ordering::AcqRel);
+            spawn_reader(
+                err,
+                logs.clone(),
+                started_flag.clone(),
+                active_readers.clone(),
+                self.capacity,
+                true,
+            );
         }
 
         let label = format!("{} / {}", project.name, cfg.name);
@@ -126,6 +140,8 @@ impl Runner {
                 started_at: chrono::Local::now().format("%H:%M:%S").to_string(),
                 logs,
                 started_flag,
+                active_readers,
+                exited_at: None,
                 child,
             },
         );
@@ -135,11 +151,15 @@ impl Runner {
     /// Refresh states from the OS and from the "Started ..." marker in the log stream.
     pub fn poll(&mut self) {
         for m in self.managed.values_mut() {
+            if matches!(m.state, RunState::Exited | RunState::Failed) {
+                continue;
+            }
             if let Ok(Some(status)) = m.child.try_wait() {
-                // `try_wait` keeps returning `Some` once the child is reaped, and
-                // poll runs on every tick: record the exit exactly once, or the
-                // ring buffer fills up with identical "[process exited]" lines.
-                if matches!(m.state, RunState::Exited | RunState::Failed) {
+                // Allow stdout/stderr reader threads a brief window to flush final
+                // error lines before appending "[process exited]" and flipping state.
+                let exited_at = *m.exited_at.get_or_insert_with(Instant::now);
+                let readers_done = m.active_readers.load(Ordering::Acquire) == 0;
+                if !readers_done && exited_at.elapsed() < Duration::from_millis(300) {
                     continue;
                 }
                 m.state = if status.success() {
@@ -215,25 +235,48 @@ impl Runner {
     }
 }
 
-fn build_invocation(
+pub(crate) fn build_invocation(
     project: &Project,
     cfg: &LaunchConfig,
     maven: Option<&Maven>,
     app_cfg: &AppConfig,
 ) -> (PathBuf, Vec<String>) {
-    let use_wrapper = project.has_wrapper && cfg.origin == "auto";
-    let program = if use_wrapper {
-        if cfg!(windows) {
-            project.path.join("mvnw.cmd")
-        } else {
-            project.path.join("mvnw")
+    let program = match project.build {
+        crate::model::BuildTool::Gradle => {
+            if project.has_wrapper {
+                if cfg!(windows) {
+                    project.path.join("gradlew.bat")
+                } else {
+                    project.path.join("gradlew")
+                }
+            } else if cfg!(windows) {
+                PathBuf::from("gradle.bat")
+            } else {
+                PathBuf::from("gradle")
+            }
         }
-    } else if let Some(m) = maven {
-        m.executable.clone()
-    } else if cfg!(windows) {
-        PathBuf::from("mvn.cmd")
-    } else {
-        PathBuf::from("mvn")
+        crate::model::BuildTool::Maven => {
+            let use_wrapper = project.has_wrapper && cfg.origin == "auto";
+            if use_wrapper {
+                if cfg!(windows) {
+                    project.path.join("mvnw.cmd")
+                } else {
+                    project.path.join("mvnw")
+                }
+            } else if let Some(m) = maven {
+                m.executable.clone()
+            } else if project.has_wrapper {
+                if cfg!(windows) {
+                    project.path.join("mvnw.cmd")
+                } else {
+                    project.path.join("mvnw")
+                }
+            } else if cfg!(windows) {
+                PathBuf::from("mvn.cmd")
+            } else {
+                PathBuf::from("mvn")
+            }
+        }
     };
 
     let mut args: Vec<String> = Vec::new();
@@ -306,14 +349,24 @@ fn push_line(buf: &LogBuf, cap: usize, line: String) {
     }
 }
 
+struct ReaderGuard(Arc<AtomicUsize>);
+
+impl Drop for ReaderGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn spawn_reader<R: Read + Send + 'static>(
     reader: R,
     buf: LogBuf,
     started: Arc<AtomicBool>,
+    active_readers: Arc<AtomicUsize>,
     cap: usize,
     is_err: bool,
 ) {
     std::thread::spawn(move || {
+        let _guard = ReaderGuard(active_readers);
         for line in BufReader::new(reader).split(b'\n') {
             let Ok(bytes) = line else { break };
             // The buffer keeps the escape sequences: the pane turns SGR codes
