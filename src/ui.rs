@@ -76,12 +76,22 @@ pub fn render(f: &mut Frame<'_>, app: &mut App) {
         Mode::JdkPicker => render_picker(f, full, app, "SELECT JDK"),
         Mode::MavenPicker => render_picker(f, full, app, "SELECT MAVEN"),
         Mode::ConfigPicker => render_picker(f, full, app, "SELECT LAUNCH CONFIG"),
-        Mode::ConfirmStop => render_confirm(
-            f,
-            full,
-            "Stop external process?",
-            "This process was started outside tspb (e.g. by IDEA).",
-        ),
+        Mode::ConfirmStop => {
+            let (title, body) = match app.confirm_pid.and_then(|pid| app.runner.find_by_pid(pid)) {
+                Some(m) => (
+                    format!("Stop {}?", m.label),
+                    format!(
+                        "pid {} · started {} (managed by tspb).",
+                        m.pid, m.started_at
+                    ),
+                ),
+                None => (
+                    "Stop external process?".to_string(),
+                    "This process was started outside tspb (e.g. by IDEA).".to_string(),
+                ),
+            };
+            render_confirm(f, full, &title, &body);
+        }
         Mode::ConfirmQuit => render_confirm(
             f,
             full,
@@ -297,7 +307,7 @@ fn render_sidebar(f: &mut Frame<'_>, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_list(f: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_list(f: &mut Frame<'_>, area: Rect, app: &mut App) {
     let width = area.width.saturating_sub(4) as usize;
     let mut items: Vec<ListItem> = Vec::new();
     for entry in app.lines() {
@@ -358,6 +368,7 @@ fn render_list(f: &mut Frame<'_>, area: Rect, app: &App) {
         state.select(app.selected_line());
     }
     f.render_stateful_widget(list, area, &mut state);
+    app.list_scroll_offset = state.offset();
 }
 
 fn render_detail(f: &mut Frame<'_>, area: Rect, app: &App) {
@@ -529,6 +540,37 @@ fn keyword_style(text: &str) -> Style {
     Style::default().fg(color)
 }
 
+/// Estimate visual terminal rows needed for a log line when wrapped at `content_width`,
+/// accounting for the 1-col cursor marker, CJK wide characters, and word boundaries.
+pub(crate) fn visual_rows(raw_line: &str, content_width: usize) -> usize {
+    if content_width <= 1 {
+        return 1;
+    }
+    let plain = crate::runner::plain_text(raw_line);
+    let mut rows = 1usize;
+    let mut col = 1usize; // leading cursor/space marker
+    for chunk in plain.split_inclusive(char::is_whitespace) {
+        let w = Line::from(chunk).width();
+        if w == 0 {
+            continue;
+        }
+        if col > 0 && col + w > content_width {
+            rows += 1;
+            col = 0;
+        }
+        if w > content_width {
+            rows += (w - 1) / content_width;
+            col = w % content_width;
+            if col == 0 {
+                col = content_width;
+            }
+        } else {
+            col += w;
+        }
+    }
+    rows.max(1)
+}
+
 fn render_log(f: &mut Frame<'_>, area: Rect, app: &App) {
     let active = is_active(app, Focus::Log);
     let height = area.height.saturating_sub(2) as usize;
@@ -560,12 +602,11 @@ fn render_log(f: &mut Frame<'_>, area: Rect, app: &App) {
             );
         }
         let content_width = area.width.saturating_sub(2).max(1) as usize;
-        let start = if app.log_follow {
-            let mut budget = height;
+        let (start, end) = if app.log_follow {
+            let mut budget = height.max(1);
             let mut s = total;
             for (i, line) in raw.iter().enumerate().rev() {
-                let len = crate::runner::plain_text(line).chars().count() + 1;
-                let vrows = len.div_ceil(content_width).max(1);
+                let vrows = visual_rows(line, content_width);
                 if budget >= vrows {
                     budget -= vrows;
                     s = i;
@@ -576,17 +617,39 @@ fn render_log(f: &mut Frame<'_>, area: Rect, app: &App) {
                     break;
                 }
             }
-            s
+            (s, total)
         } else {
-            app.log_scroll.min(total.saturating_sub(height))
+            let mut s = app.log_scroll.min(total.saturating_sub(1));
+            let cursor = app.log_cursor.min(total.saturating_sub(1));
+            if cursor >= s && height > 0 {
+                // If earlier wrapped lines push the cursor past the viewport height,
+                // advance `s` just enough so the active cursor line stays visible.
+                let mut span_rows: usize = raw[s..=cursor]
+                    .iter()
+                    .map(|l| visual_rows(l, content_width))
+                    .sum();
+                while span_rows > height && s < cursor {
+                    span_rows = span_rows.saturating_sub(visual_rows(&raw[s], content_width));
+                    s += 1;
+                }
+            }
+            let mut used = 0usize;
+            let mut e = s;
+            for line in raw.iter().skip(s) {
+                let vrows = visual_rows(line, content_width);
+                if e > s && used + vrows > height {
+                    break;
+                }
+                used += vrows;
+                e += 1;
+                if used >= height {
+                    break;
+                }
+            }
+            (s, e)
         };
         let selection = app.log_selection();
-        let iter = if app.log_follow {
-            raw.iter().skip(start).take(total.saturating_sub(start))
-        } else {
-            raw.iter().skip(start).take(height)
-        };
-        for (offset, text) in iter.enumerate() {
+        for (offset, text) in raw[start..end].iter().enumerate() {
             let abs = start + offset;
             // `ansi-to-tui` turns the app's own SGR codes into ratatui styles, so
             // Spring's INFO/WARN/ERROR colours survive. Lines without codes fall

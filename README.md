@@ -288,7 +288,7 @@ Press the prefix, release it, then press a key — that key belongs to the TUI a
 | --- | --- |
 | `/` | Type a filter (arrow keys move the caret, `Enter` / `Esc` finishes) |
 | `w` `b` `i` `d` `a` | Filter by `WORKING` / `BLOCKED` / `IDLE` / `DONE`; `a` shows everything |
-| `s` / `R` | Stop / restart the selected app (stopping an external process asks first) |
+| `s` / `R` | Stop / restart the selected app (stopping a running process asks first) |
 | `J` / `M` / `c` / `Tab` | Pick JDK / Maven / IDEA run configuration / cycle configurations |
 | `r` / `?` | Rescan / help |
 | `g` | Goto picker (in the LOG pane it jumps to the first line) |

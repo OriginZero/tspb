@@ -389,6 +389,55 @@ fn confirm_gate_for_external_process_stop() {
     assert!(app.confirm_pid.is_none());
 }
 
+#[cfg(windows)]
+#[test]
+fn confirm_gate_for_managed_running_process_stop() {
+    let jdk = Jdk {
+        name: "test-jdk".into(),
+        home: std::env::temp_dir(),
+        version: "17".into(),
+        java: PathBuf::from("java.exe"),
+        origin: Origin::Env,
+    };
+    let mut runner = Runner::new(100);
+    let (project, id) = fake_service("svc-confirm", "CONFIRM_READY", &jdk, &mut runner);
+    let tmp = project.path.clone();
+    wait_for_line(&mut runner, &id, "CONFIRM_READY");
+    let pid = runner.managed[&id].pid;
+
+    let mut app = test_app();
+    app.inv.projects = vec![project];
+    app.inv.running.clear();
+    app.runner = runner;
+    app.rebuild_rows();
+    app.selected = app
+        .rows
+        .iter()
+        .position(|r| matches!(r.kind, RowKind::App { pid: Some(p), .. } if p == pid))
+        .unwrap();
+
+    // Pressing `s` on a running managed service must ask first instead of killing immediately.
+    app.handle(Action::Stop);
+    assert_eq!(app.mode, Mode::ConfirmStop);
+    assert_eq!(app.confirm_pid, Some(pid));
+    assert!(app.runner.managed.contains_key(&id));
+
+    // Esc cancels without stopping.
+    app.handle(Action::Esc);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(app.confirm_pid.is_none());
+    assert!(app.runner.managed.contains_key(&id));
+
+    // Enter confirms and stops the managed service, clearing its log stream.
+    app.handle(Action::Stop);
+    app.handle(Action::Enter);
+    assert_eq!(app.mode, Mode::Normal);
+    assert!(!app.runner.managed.contains_key(&id));
+    assert!(app.current_log_id().is_none());
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn config_roundtrip_preserves_settings() {
     let cfg = Config {
@@ -1766,6 +1815,15 @@ fn unmanaged_running_app_discovers_log_file_and_streams_it() {
     app.tick();
     assert_eq!(app.log_len_of(&log_id), 2);
 
+    // When the external running process exits / is stopped, the stale file log must clear.
+    app.inv.running.clear();
+    app.rebuild_rows();
+    app.tick();
+    assert!(
+        app.current_log_id().is_none(),
+        "stopped external app must not leave stale file log on screen"
+    );
+
     let _ = fs::remove_dir_all(&tmp);
 }
 
@@ -1974,6 +2032,26 @@ fn find_log_file_does_not_cross_contaminate_shared_logs_dir() {
         "gateway with no log must not hijack sibling jeecg-system log: {found_gw:?}"
     );
 
+    // Idle project row (pid = None) must not bind to an external log file.
+    let mut app = test_app();
+    app.inv.projects = vec![Project {
+        name: "sys-cloud-start".into(),
+        path: sys_dir.clone(),
+        build: BuildTool::Maven,
+        has_wrapper: false,
+        main_class: Some("org.jeecg.JeecgSystemCloudApplication".into()),
+        java_version: Some(17),
+        launch_configs: vec![],
+        origin: Origin::Project,
+    }];
+    app.inv.running.clear();
+    app.rebuild_rows();
+    app.selected = app.rows.iter().position(|r| r.group == "PROJECTS").unwrap();
+    assert!(
+        app.current_log_id().is_none(),
+        "idle project row should not pretend to have a live log stream"
+    );
+
     let _ = fs::remove_dir_all(&tmp);
 }
 
@@ -2041,6 +2119,84 @@ fn spring_config_extracts_nested_yaml_and_properties_log_settings() {
         "application.properties spring.application.name + logging.file.path must resolve: {found_props:?}"
     );
 
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[cfg(windows)]
+#[test]
+fn tui_jdk_picker_overrides_pom_java_version_and_reports_actual_jdk() {
+    use std::fs;
+    let tmp = std::env::temp_dir().join(format!("tspb-jdk-pin-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let bin = tmp.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("mvn.cmd"),
+        "@echo off\r\necho JDK_USED=%JAVA_HOME%\r\nping -n 30 127.0.0.1 >nul\r\n",
+    )
+    .unwrap();
+
+    let mut inv = fake_inventory();
+    inv.jdks = vec![
+        Jdk {
+            name: "azul-17".into(),
+            home: tmp.join("jdk17"),
+            version: "17.0.9".into(),
+            java: tmp.join("jdk17/bin/java.exe"),
+            origin: Origin::Idea,
+        },
+        Jdk {
+            name: "corretto-21".into(),
+            home: tmp.join("jdk21"),
+            version: "21.0.5".into(),
+            java: tmp.join("jdk21/bin/java.exe"),
+            origin: Origin::Idea,
+        },
+    ];
+    inv.mavens = vec![Maven {
+        name: "fake-mvn".into(),
+        home: tmp.clone(),
+        version: "3.9".into(),
+        executable: bin.join("mvn.cmd"),
+        origin: Origin::Env,
+        wrapper: false,
+    }];
+    inv.projects = vec![Project {
+        name: "svc17".into(),
+        path: tmp.clone(),
+        build: BuildTool::Maven,
+        has_wrapper: false,
+        main_class: Some("com.example.DemoApplication".into()),
+        java_version: Some(17),
+        launch_configs: vec![launch_config("DemoApplication", "IDEA run configuration")],
+        origin: Origin::Project,
+    }];
+
+    let mut app = App::with_inventory(Config::default(), inv);
+    assert_eq!(app.active_jdk, 0);
+    // Explicitly switch to JDK 21 via JdkPicker in the TUI.
+    app.handle(Action::JdkPicker);
+    app.handle(Action::Move(1));
+    app.handle(Action::Enter);
+    assert_eq!(app.active_jdk, 1);
+    assert!(app.jdk_pinned);
+
+    let proj_row = app.rows.iter().position(|r| r.group == "PROJECTS").unwrap();
+    app.selected = proj_row;
+    let id = app.launch_project(0).unwrap();
+    wait_for_line(&mut app.runner, &id, "JDK_USED=");
+    let logs = app.runner.logs_for(&id);
+    assert!(
+        logs.iter().any(|l| l.contains("jdk21")),
+        "TUI JdkPicker choice must override pom java.version 17: {logs:?}"
+    );
+    assert!(
+        app.message.contains("corretto-21"),
+        "status message must report actual JDK used: {}",
+        app.message
+    );
+
+    let _ = app.stop_managed(&id);
     let _ = fs::remove_dir_all(&tmp);
 }
 
@@ -2117,4 +2273,46 @@ fn gradle_project_uses_gradlew_and_not_mvnw() {
         "gradle project must invoke gradlew, got {pname}"
     );
     assert!(args.iter().any(|a| a == "bootRun"));
+}
+
+#[test]
+fn view_counts_cjk_wrapping_and_scrolled_mouse_click_stay_consistent() {
+    let mut app = test_app();
+    // Managed process + deduped running app should count once in Running.
+    app.inv.running.push(RunningApp {
+        pid: 5555,
+        main_class: "org.other.OtherApp".into(),
+        name: "OtherApp".into(),
+        jdk_home: None,
+        work_dir: None,
+        ports: vec![],
+        cmdline: "java org.other.OtherApp".into(),
+        managed: false,
+        origin: Origin::System,
+    });
+    app.rebuild_rows();
+    let expected_running = app.rows.iter().filter(|r| r.group == "RUNNING").count();
+    assert_eq!(app.view_count(View::Running), expected_running);
+    assert_eq!(app.view_count(View::All), app.rows.len());
+
+    // CJK characters occupy 2 terminal columns each.
+    let cjk = "2026-11-24 INFO 任务【测试】创建通知已发送至执行人";
+    assert!(
+        crate::ui::visual_rows(cjk, 40) >= 2,
+        "CJK double-width line must budget >=2 rows at width 40"
+    );
+
+    // Scrolled mouse click respects list_scroll_offset.
+    app.list_scroll_offset = 1;
+    app.hitboxes.list = ratatui::layout::Rect::new(0, 0, 80, 10);
+    app.handle(Action::Mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 5,
+        row: 2, // 2nd content line -> lines()[1 + 1]
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    }));
+    let target_row = app.lines().get(2).and_then(|l| l.row);
+    if let Some(r) = target_row {
+        assert_eq!(app.selected, r);
+    }
 }

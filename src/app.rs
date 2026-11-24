@@ -6,9 +6,10 @@ use crate::scan;
 use anyhow::Result;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
@@ -104,11 +105,15 @@ pub struct LineEntry {
 
 #[derive(Clone, Debug)]
 pub struct FileLogState {
+    pub pid: Option<u32>,
     pub path: PathBuf,
     pub last_read: Instant,
     pub last_len: u64,
+    pub last_modified: Option<SystemTime>,
     pub lines: Vec<String>,
 }
+
+pub type LogFileCache = RefCell<HashMap<(Option<usize>, Option<u32>), (Instant, Option<PathBuf>)>>;
 
 pub struct App {
     pub cfg: Config,
@@ -135,10 +140,12 @@ pub struct App {
     pub help_scroll: usize,
     pub status_filter: Option<StatusFilter>,
     pub active_jdk: usize,
+    pub jdk_pinned: bool,
     pub active_maven: usize,
     pub active_config: HashMap<String, usize>,
     pub selected_log_id: Option<String>,
     pub file_logs: HashMap<String, FileLogState>,
+    log_file_cache: LogFileCache,
     pub log_follow: bool,
     pub log_scroll: usize,
     /// Absolute index of the yank/scroll cursor inside the log ring buffer.
@@ -151,6 +158,8 @@ pub struct App {
     pub clipboard: Option<String>,
     /// Number of visible log lines, written by the renderer each frame.
     pub log_view_height: usize,
+    /// Current scroll offset of the ITEMS list widget, written by the renderer.
+    pub list_scroll_offset: usize,
     pub message: String,
     pub scan_root: std::path::PathBuf,
     pub confirm_pid: Option<u32>,
@@ -206,10 +215,12 @@ impl App {
             help_scroll: 0,
             status_filter: None,
             active_jdk: 0,
+            jdk_pinned: cfg.preferred_jdk.is_some(),
             active_maven: 0,
             active_config: HashMap::new(),
             selected_log_id: None,
             file_logs: HashMap::new(),
+            log_file_cache: RefCell::new(HashMap::new()),
             log_follow: true,
             log_scroll: 0,
             log_cursor: 0,
@@ -217,6 +228,7 @@ impl App {
             visual_anchor: None,
             clipboard: None,
             log_view_height: 10,
+            list_scroll_offset: 0,
             message: String::new(),
             scan_root: cfg.effective_root(),
             confirm_pid: None,
@@ -294,20 +306,81 @@ impl App {
 
     // ---------------------------------------------------------------- rows
 
-    fn match_project(&self, main_class: &str) -> Option<usize> {
+    fn match_running_project(&self, app: &RunningApp) -> Option<usize> {
+        if let Some(wd) = app.work_dir.as_deref()
+            && let Some(pi) = self.inv.projects.iter().position(|p| p.path == wd)
+        {
+            return Some(pi);
+        }
+        let main_class = app.main_class.as_str();
         let short = main_class.rsplit('.').next().unwrap_or(main_class);
-        self.inv.projects.iter().position(|p| {
+        let cmd_norm = app.cmdline.replace('\\', "/").to_lowercase();
+        let matches_main = |p: &Project| {
             p.main_class.as_deref() == Some(main_class)
                 || p.launch_configs.iter().any(|c| {
                     c.main_class
                         .as_deref()
                         .is_some_and(|m| m == main_class || m.rsplit('.').next() == Some(short))
                 })
+        };
+
+        let candidates: Vec<usize> = self
+            .inv
+            .projects
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| matches_main(p))
+            .map(|(i, _)| i)
+            .collect();
+
+        if candidates.len() > 1 {
+            // Disambiguate modules sharing a main class by path in cmdline or IDEA <module>.
+            if let Some(&pi) = candidates.iter().find(|&&i| {
+                let p_norm = self.inv.projects[i]
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_lowercase();
+                !p_norm.is_empty() && cmd_norm.contains(&p_norm)
+            }) {
+                return Some(pi);
+            }
+            if let Some(&pi) = candidates.iter().find(|&&i| {
+                let p = &self.inv.projects[i];
+                p.launch_configs.iter().any(|c| {
+                    c.main_class.as_deref() == Some(main_class)
+                        && c.idea_module
+                            .as_deref()
+                            .is_some_and(|m| m.eq_ignore_ascii_case(&p.name))
+                })
+            }) {
+                return Some(pi);
+            }
+        }
+        if let Some(&first) = candidates.first() {
+            return Some(first);
+        }
+        self.inv
+            .projects
+            .iter()
+            .position(|p| p.name.eq_ignore_ascii_case(&app.name))
+    }
+
+    fn is_deduped_running_app(&self, a: &RunningApp) -> bool {
+        if self.runner.find_by_pid(a.pid).is_some() {
+            return true;
+        }
+        self.runner.managed.values().any(|m| {
+            matches!(m.state, RunState::Starting | RunState::Running)
+                && (self
+                    .match_running_project(a)
+                    .is_some_and(|pi| self.inv.projects[pi].path == m.project_path)
+                    || a.work_dir.as_deref() == Some(&m.project_path))
         })
     }
 
     pub fn rebuild_rows(&mut self) {
-        let old_key = self.rows.get(self.selected).map(row_key);
+        let old_key = self.rows.get(self.selected).map(|r| self.row_key(r));
         let mut rows: Vec<Row> = Vec::new();
         let view = self.view;
         let show_running = matches!(view, View::All | View::Running);
@@ -322,7 +395,9 @@ impl App {
 
         // Managed processes started by this TUI first (they are the freshest state).
         if show_running {
-            for m in self.runner.managed.values() {
+            let mut managed_list: Vec<_> = self.runner.managed.values().collect();
+            managed_list.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.pid.cmp(&b.pid)));
+            for m in managed_list {
                 let ports = self
                     .inv
                     .running
@@ -330,7 +405,7 @@ impl App {
                     .find_map(|a| {
                         let is_match = a.pid == m.pid
                             || (self
-                                .match_project(&a.main_class)
+                                .match_running_project(a)
                                 .is_some_and(|pi| self.inv.projects[pi].path == m.project_path))
                             || a.work_dir.as_deref() == Some(&m.project_path);
                         if is_match && !a.ports.is_empty() {
@@ -368,17 +443,7 @@ impl App {
                 });
             }
             for a in &self.inv.running {
-                if self.runner.find_by_pid(a.pid).is_some() {
-                    continue;
-                }
-                // Skip if this Java app is already managed by an active runner process
-                if self.runner.managed.values().any(|m| {
-                    matches!(m.state, RunState::Starting | RunState::Running)
-                        && (self
-                            .match_project(&a.main_class)
-                            .is_some_and(|pi| self.inv.projects[pi].path == m.project_path)
-                            || a.work_dir.as_deref() == Some(&m.project_path))
-                }) {
+                if self.is_deduped_running_app(a) {
                     continue;
                 }
                 let ports = if a.ports.is_empty() {
@@ -395,7 +460,7 @@ impl App {
                 };
                 rows.push(Row {
                     kind: RowKind::App {
-                        project: self.match_project(&a.main_class),
+                        project: self.match_running_project(a),
                         pid: Some(a.pid),
                     },
                     group: "RUNNING".into(),
@@ -471,7 +536,7 @@ impl App {
         });
         self.rows = rows;
         self.selected = old_key
-            .and_then(|k| self.rows.iter().position(|r| row_key(r) == k))
+            .and_then(|k| self.rows.iter().position(|r| self.row_key(r) == k))
             .unwrap_or(self.selected)
             .min(self.rows.len().saturating_sub(1));
     }
@@ -505,15 +570,25 @@ impl App {
         self.rows.get(self.selected)
     }
 
+    fn running_row_count(&self) -> usize {
+        self.runner.managed.len()
+            + self
+                .inv
+                .running
+                .iter()
+                .filter(|a| !self.is_deduped_running_app(a))
+                .count()
+    }
+
     pub fn view_count(&self, view: View) -> usize {
         match view {
             View::All => {
-                self.inv.running.len()
+                self.running_row_count()
                     + self.inv.projects.len()
                     + self.inv.jdks.len()
                     + self.inv.mavens.len()
             }
-            View::Running => self.inv.running.len(),
+            View::Running => self.running_row_count(),
             View::Projects => self.inv.projects.len(),
             View::EnvTools => {
                 self.inv
@@ -601,6 +676,12 @@ impl App {
             RowKind::App { project, pid } => (project, pid),
             _ => return None,
         };
+        let key = (project, pid);
+        if let Some((checked_at, cached)) = self.log_file_cache.borrow().get(&key)
+            && checked_at.elapsed() < Duration::from_secs(2)
+        {
+            return cached.clone();
+        }
         let running_app = pid.and_then(|p| self.inv.running.iter().find(|a| a.pid == p));
         let project_obj = project.and_then(|pi| self.inv.projects.get(pi));
 
@@ -615,7 +696,7 @@ impl App {
         let work_dir = running_app.and_then(|a| a.work_dir.as_deref());
         let cmdline = running_app.map(|a| a.cmdline.as_str());
 
-        crate::scan::project::find_log_file(
+        let found = crate::scan::project::find_log_file(
             project_path,
             project_name,
             main_class,
@@ -623,7 +704,11 @@ impl App {
             work_dir,
             cmdline,
             &self.cfg.scan_roots,
-        )
+        );
+        self.log_file_cache
+            .borrow_mut()
+            .insert(key, (Instant::now(), found.clone()));
+        found
     }
 
     /// The stream the LOG pane renders. The selected row wins, so moving the
@@ -644,16 +729,31 @@ impl App {
                 {
                     return Some(m.id.clone());
                 }
-                self.find_log_file_for_row(row)
-                    .map(|p| format!("file://{}", p.display()))
+                if pid.is_some() {
+                    return self
+                        .find_log_file_for_row(row)
+                        .map(|p| format!("file://{}", p.display()));
+                }
+                None
             }
             _ => None,
         });
         from_row.or_else(|| {
-            self.selected_log_id
-                .clone()
-                .filter(|id| self.runner.managed.contains_key(id) || id.starts_with("file://"))
+            self.selected_log_id.clone().filter(|id| {
+                self.runner.managed.contains_key(id)
+                    || (id.starts_with("file://") && self.is_live_file_log(id))
+            })
         })
+    }
+
+    fn is_live_file_log(&self, id: &str) -> bool {
+        if self.inv.running.is_empty() {
+            return false;
+        }
+        match self.file_logs.get(id).and_then(|s| s.pid) {
+            Some(pid) => self.inv.running.iter().any(|a| a.pid == pid),
+            None => false,
+        }
     }
 
     pub fn logs_for(&self, id: &str) -> Vec<String> {
@@ -766,11 +866,21 @@ impl App {
                 return self.navigate_move(if action == Action::PageDown { 10 } else { -10 });
             }
             Action::Home => {
-                self.selected = 0;
+                if self.layer == Layer::Content && self.focus == Focus::Sidebar {
+                    self.set_view(View::ALL[0]);
+                } else {
+                    self.selected = 0;
+                }
                 return;
             }
             Action::End => {
-                self.selected = self.rows.len().saturating_sub(1);
+                if self.layer == Layer::Content && self.focus == Focus::Sidebar {
+                    if let Some(&last) = View::ALL.last() {
+                        self.set_view(last);
+                    }
+                } else {
+                    self.selected = self.rows.len().saturating_sub(1);
+                }
                 return;
             }
             _ => {}
@@ -845,8 +955,12 @@ impl App {
             Action::Focus(n) => self.set_focus(n),
             Action::ToggleSidebar => {
                 self.show_sidebar = !self.show_sidebar;
-                if !self.show_sidebar && self.focus == Focus::Sidebar {
-                    self.reset_hidden_focus(Focus::List);
+                if !self.show_sidebar {
+                    if self.focus == Focus::Sidebar {
+                        self.reset_hidden_focus(Focus::List);
+                    } else if self.zoom == Some(Focus::Sidebar) {
+                        self.zoom = None;
+                    }
                 }
             }
             Action::ToggleLog => self.toggle_log_pane(),
@@ -985,11 +1099,41 @@ impl App {
 
     pub fn goto_items(&self) -> Vec<(String, usize)> {
         let needle = self.goto_filter.trim().to_lowercase();
+        let mut counts: HashMap<(&str, &str), usize> = HashMap::new();
+        for r in &self.rows {
+            *counts
+                .entry((r.group.as_str(), r.label.as_str()))
+                .or_insert(0) += 1;
+        }
         self.rows
             .iter()
             .enumerate()
             .filter(|(_, r)| needle.is_empty() || r.search_text().to_lowercase().contains(&needle))
-            .map(|(i, r)| (format!("[{}] {}", r.group, r.label), i))
+            .map(|(i, r)| {
+                let dup = counts
+                    .get(&(r.group.as_str(), r.label.as_str()))
+                    .copied()
+                    .unwrap_or(0)
+                    > 1;
+                let title = if dup {
+                    if let RowKind::App {
+                        project: Some(pi), ..
+                    } = r.kind
+                    {
+                        format!(
+                            "[{}] {} ({})",
+                            r.group,
+                            r.label,
+                            self.inv.projects[pi].path.display()
+                        )
+                    } else {
+                        format!("[{}] {} ({})", r.group, r.label, r.detail)
+                    }
+                } else {
+                    format!("[{}] {}", r.group, r.label)
+                };
+                (title, i)
+            })
             .collect()
     }
 
@@ -1019,6 +1163,7 @@ impl App {
                 match self.mode {
                     Mode::JdkPicker => {
                         self.active_jdk = self.picker_selected;
+                        self.jdk_pinned = true;
                         self.message = format!("JDK -> {}", self.jdk_label());
                     }
                     Mode::MavenPicker => {
@@ -1062,12 +1207,19 @@ impl App {
         }
         if was_stop {
             if let Some(pid) = self.confirm_pid.take() {
-                match Runner::stop_external(pid) {
-                    Ok(()) => {
-                        self.message = format!("sent stop to pid {pid}");
-                        self.refresh_processes();
+                if let Some(m) = self.runner.find_by_pid(pid) {
+                    let id = m.id.clone();
+                    self.finish_stop_managed(&id, false);
+                } else {
+                    match Runner::stop_external(pid) {
+                        Ok(()) => {
+                            self.reset_log_stream();
+                            self.file_logs.retain(|_, s| s.pid != Some(pid));
+                            self.message = format!("sent stop to pid {pid}");
+                            self.refresh_processes();
+                        }
+                        Err(e) => self.message = format!("stop failed: {e}"),
                     }
-                    Err(e) => self.message = format!("stop failed: {e}"),
                 }
             }
         } else {
@@ -1409,6 +1561,7 @@ impl App {
         match row.kind {
             RowKind::Jdk(i) => {
                 self.active_jdk = i;
+                self.jdk_pinned = true;
                 self.message = format!("JDK -> {}", self.jdk_label());
             }
             RowKind::Maven(i) => {
@@ -1442,10 +1595,18 @@ impl App {
         let Some(cfg) = self.config_of(pi).cloned() else {
             anyhow::bail!("no launch configuration for {}", project.name);
         };
-        // An explicit preferred_jdk wins; otherwise honour this module's own
-        // <java.version> even if the global default points at another JDK.
-        let jdk = if self.cfg.preferred_jdk.is_some() {
+        // Priority: explicit user/config JDK selection > IDEA run config JRE >
+        // pom <java.version> match > active_jdk fallback.
+        let jdk = if self.jdk_pinned {
             self.inv.jdks[self.active_jdk].clone()
+        } else if let Some(jre) = cfg.jre_name.as_deref()
+            && let Some(found) = self
+                .inv
+                .jdks
+                .iter()
+                .find(|j| j.name.to_lowercase().contains(&jre.to_lowercase()))
+        {
+            found.clone()
         } else {
             self.inv
                 .jdks
@@ -1469,9 +1630,8 @@ impl App {
                 self.log_follow = true;
                 self.sync_log_view();
                 self.message = format!(
-                    "launched {} with {} · log is live",
-                    project.name,
-                    self.jdk_label()
+                    "launched {} with {} ({}) · log is live",
+                    project.name, jdk.name, jdk.version
                 );
                 self.refresh_processes();
                 Ok(id)
@@ -1488,7 +1648,7 @@ impl App {
             self.inv.running.iter().find_map(|a| {
                 let matches = a.pid == m.pid
                     || (self
-                        .match_project(&a.main_class)
+                        .match_running_project(a)
                         .is_some_and(|pi| self.inv.projects[pi].path == m.project_path))
                     || a.work_dir.as_deref() == Some(&m.project_path);
                 if matches { Some(a.pid) } else { None }
@@ -1501,6 +1661,21 @@ impl App {
             let _ = Runner::stop_external(jpid);
         }
         res
+    }
+
+    fn finish_stop_managed(&mut self, id: &str, was_dead: bool) {
+        match self.stop_managed(id) {
+            Ok(()) => {
+                self.reset_log_stream();
+                self.message = if was_dead {
+                    format!("dismissed {id}")
+                } else {
+                    format!("stopped {id}")
+                };
+                self.refresh_processes();
+            }
+            Err(e) => self.message = format!("stop failed: {e}"),
+        }
     }
 
     fn stop_selected(&mut self) {
@@ -1518,18 +1693,12 @@ impl App {
         if let Some(m) = self.runner.find_by_pid(pid) {
             let id = m.id.clone();
             let was_dead = matches!(m.state, RunState::Failed | RunState::Exited);
-            match self.stop_managed(&id) {
-                Ok(()) => {
-                    self.selected_log_id = None;
-                    self.message = if was_dead {
-                        format!("dismissed {id}")
-                    } else {
-                        format!("stopped {id}")
-                    };
-                    self.refresh_processes();
-                }
-                Err(e) => self.message = format!("stop failed: {e}"),
+            if !was_dead {
+                self.confirm_pid = Some(pid);
+                self.mode = Mode::ConfirmStop;
+                return;
             }
+            self.finish_stop_managed(&id, true);
         } else {
             self.confirm_pid = Some(pid);
             self.mode = Mode::ConfirmStop;
@@ -1564,6 +1733,7 @@ impl App {
     }
 
     fn refresh_all(&mut self) {
+        self.log_file_cache.borrow_mut().clear();
         match scan::collect(&self.cfg) {
             Ok(inv) => {
                 self.inv = inv;
@@ -1580,7 +1750,30 @@ impl App {
 
     fn refresh_processes(&mut self) {
         self.inv.running = scan::process::scan();
+        self.log_file_cache.borrow_mut().clear();
+        self.prune_stopped_file_logs();
         self.rebuild_rows();
+    }
+
+    fn reset_log_stream(&mut self) {
+        self.selected_log_id = None;
+        self.shown_log_id = None;
+        self.visual_anchor = None;
+        self.log_scroll = 0;
+        self.log_cursor = 0;
+    }
+
+    fn prune_stopped_file_logs(&mut self) {
+        self.file_logs.retain(|_, s| {
+            s.pid
+                .is_some_and(|p| self.inv.running.iter().any(|a| a.pid == p))
+        });
+        if let Some(id) = self.selected_log_id.as_deref()
+            && id.starts_with("file://")
+            && !self.is_live_file_log(id)
+        {
+            self.reset_log_stream();
+        }
     }
 
     fn poll_file_logs(&mut self) {
@@ -1590,13 +1783,18 @@ impl App {
         let Some(path_str) = id.strip_prefix("file://") else {
             return;
         };
+        let row_pid = self.current_row().and_then(|r| match r.kind {
+            RowKind::App { pid, .. } => pid,
+            _ => None,
+        });
         let now = Instant::now();
         let (should_read, path) = match self.file_logs.get(&id) {
             Some(state) => {
                 let should = if state.last_read.elapsed() >= Duration::from_millis(250) {
-                    let current_len = std::fs::metadata(&state.path).map(|m| m.len()).unwrap_or(0);
-                    current_len != state.last_len
-                        || state.last_read.elapsed() >= Duration::from_secs(2)
+                    let meta = std::fs::metadata(&state.path).ok();
+                    let current_len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                    let current_mod = meta.and_then(|m| m.modified().ok());
+                    current_len != state.last_len || current_mod != state.last_modified
                 } else {
                     false
                 };
@@ -1606,16 +1804,25 @@ impl App {
         };
 
         if should_read && let Ok(lines) = crate::scan::project::read_file_tail(&path, 2000) {
-            let current_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let meta = std::fs::metadata(&path).ok();
+            let current_len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let current_mod = meta.and_then(|m| m.modified().ok());
             self.file_logs.insert(
                 id.clone(),
                 FileLogState {
+                    pid: row_pid,
                     path,
                     last_read: now,
                     last_len: current_len,
+                    last_modified: current_mod,
                     lines,
                 },
             );
+        } else if let Some(pid) = row_pid
+            && let Some(state) = self.file_logs.get_mut(&id)
+            && state.pid.is_none()
+        {
+            state.pid = Some(pid);
         }
     }
 
@@ -1682,17 +1889,25 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if in_rect(self.hitboxes.sidebar, x, y) {
-                    let idx = y.saturating_sub(self.hitboxes.sidebar.y + 1) as usize;
-                    if let Some(v) = View::ALL.get(idx) {
-                        self.set_view(*v);
+                    if y > self.hitboxes.sidebar.y
+                        && y + 1 < self.hitboxes.sidebar.y + self.hitboxes.sidebar.height
+                    {
+                        let idx = (y - self.hitboxes.sidebar.y - 1) as usize;
+                        if let Some(v) = View::ALL.get(idx) {
+                            self.set_view(*v);
+                        }
                     }
                     self.enter_pane(Focus::Sidebar);
                 } else if in_rect(self.hitboxes.list, x, y) {
-                    let idx = y.saturating_sub(self.hitboxes.list.y + 1) as usize;
-                    if let Some(entry) = self.lines().get(idx)
-                        && let Some(r) = entry.row
+                    if y > self.hitboxes.list.y
+                        && y + 1 < self.hitboxes.list.y + self.hitboxes.list.height
                     {
-                        self.selected = r;
+                        let idx = self.list_scroll_offset + (y - self.hitboxes.list.y - 1) as usize;
+                        if let Some(entry) = self.lines().get(idx)
+                            && let Some(r) = entry.row
+                        {
+                            self.selected = r;
+                        }
                     }
                     self.enter_pane(Focus::List);
                 } else if in_rect(self.hitboxes.log, x, y) {
@@ -1700,6 +1915,24 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+    fn row_key(&self, r: &Row) -> String {
+        match r.kind {
+            RowKind::App {
+                project: Some(pi),
+                pid,
+            } => format!(
+                "{}::{}::{:?}",
+                r.group,
+                self.inv.projects[pi].path.display(),
+                pid
+            ),
+            RowKind::App { project: None, pid } => {
+                format!("{}::{}::{:?}", r.group, r.label, pid)
+            }
+            RowKind::Jdk(i) => format!("JDK::{}", self.inv.jdks[i].home.display()),
+            RowKind::Maven(i) => format!("MAVEN::{}", self.inv.mavens[i].home.display()),
         }
     }
 }
@@ -1717,10 +1950,6 @@ fn jdk_major(version: &str) -> Option<u32> {
         major = minor.parse().ok()?;
     }
     Some(major)
-}
-
-fn row_key(r: &Row) -> String {
-    format!("{}::{}", r.group, r.label)
 }
 
 fn clamp_move(cur: usize, d: i32, len: usize) -> usize {
