@@ -19,6 +19,8 @@ fn launch_config(name: &str, origin: &str) -> LaunchConfig {
         name: name.into(),
         main_class: Some("com.example.DemoApplication".into()),
         module_dir: None,
+        idea_module: None,
+        jre_name: None,
         vm_options: String::new(),
         program_args: String::new(),
         active_profiles: String::new(),
@@ -1787,4 +1789,332 @@ fn read_file_tail_reads_tail_within_limit() {
     assert_eq!(tail[9], "line 49");
 
     let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn idea_module_binding_disambiguates_duplicate_main_classes() {
+    use std::fs;
+    let tmp = std::env::temp_dir().join(format!("tspb-idea-mod-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let mod_a = tmp.join("mod-process").join("mod-process-start");
+    let mod_b = tmp.join("server-cloud").join("mod-process-cloud-start");
+    for m in [&mod_a, &mod_b] {
+        fs::create_dir_all(m.join("src/main/java/org/demo")).unwrap();
+        fs::write(
+            m.join("pom.xml"),
+            "<project><build><plugins><plugin>\
+             <groupId>org.springframework.boot</groupId>\
+             <artifactId>spring-boot-maven-plugin</artifactId></plugin></plugins></build></project>",
+        )
+        .unwrap();
+        fs::write(
+            m.join("src/main/java/org/demo/ProcessCloudApplication.java"),
+            "package org.demo;\n@SpringBootApplication\npublic class ProcessCloudApplication {}\n",
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(tmp.join(".idea")).unwrap();
+    // Commented java.version in root pom must be ignored in favour of 17.
+    fs::write(
+        tmp.join("pom.xml"),
+        "<project><artifactId>parent</artifactId><packaging>pom</packaging>\
+         <!-- <java.version>1.8</java.version> -->\
+         <properties><java.version>17</java.version></properties></project>",
+    )
+    .unwrap();
+    fs::write(
+        tmp.join(".idea/workspace.xml"),
+        r#"<?xml version="1.0"?><project><component name="RunManager">
+  <configuration name="ProcessCloudApplication" type="Application" temporary="true">
+    <option name="ALTERNATIVE_JRE_PATH" value="graalvm-17" />
+    <option name="ALTERNATIVE_JRE_PATH_ENABLED" value="true" />
+    <option name="MAIN_CLASS_NAME" value="org.demo.ProcessCloudApplication" />
+    <module name="mod-process-cloud-start" />
+  </configuration>
+  <configuration name="MavenCleanInstall" type="MavenRunConfiguration">
+    <option name="goals" value="clean install" />
+  </configuration>
+  <!-- spring-boot:run in comment elsewhere must not make MavenCleanInstall a boot cfg -->
+</component></project>"#,
+    )
+    .unwrap();
+
+    let cfg = Config {
+        scan_roots: vec![tmp.clone()],
+        max_depth: 4,
+        strict_roots: true,
+        ..Default::default()
+    };
+    let projects = crate::scan::project::scan(&cfg, &[], &crate::progress::Reporter::silent());
+    let a = projects
+        .iter()
+        .find(|p| p.name == "mod-process-start")
+        .unwrap();
+    let b = projects
+        .iter()
+        .find(|p| p.name == "mod-process-cloud-start")
+        .unwrap();
+
+    assert_eq!(a.java_version, Some(17), "commented java.version ignored");
+    assert!(
+        !a.launch_configs
+            .iter()
+            .any(|c| c.name == "ProcessCloudApplication"),
+        "IDEA config bound to mod-process-cloud-start must not leak to mod-process-start: {:?}",
+        a.launch_configs
+    );
+    assert!(
+        !b.launch_configs
+            .iter()
+            .any(|c| c.name == "MavenCleanInstall"),
+        "unrelated MavenRunConfiguration must not be treated as spring-boot:run"
+    );
+    let idea_cfg = b
+        .launch_configs
+        .iter()
+        .find(|c| c.name == "ProcessCloudApplication")
+        .expect("IDEA config bound to mod-process-cloud-start");
+    assert_eq!(idea_cfg.jre_name.as_deref(), Some("graalvm-17"));
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn find_log_file_does_not_cross_contaminate_shared_logs_dir() {
+    use std::fs;
+    let tmp = std::env::temp_dir().join(format!("tspb-shared-logs-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let cloud = tmp.join("server-cloud");
+    let logs = cloud.join("logs");
+    let sys_dir = cloud.join("sys-cloud-start");
+    let gw_dir = cloud.join("cloud-gateway");
+    let file_dir = cloud.join("file-cloud-start");
+    for d in [&sys_dir, &gw_dir, &file_dir] {
+        fs::create_dir_all(d.join("src/main/resources")).unwrap();
+    }
+    fs::create_dir_all(&logs).unwrap();
+
+    fs::write(
+        sys_dir.join("src/main/resources/logback-spring.xml"),
+        "<configuration><property name=\"LOG_HOME\" value=\"../logs\" />\
+         <appender name=\"FILE\"><rollingPolicy><FileNamePattern>${LOG_HOME}/jeecg-system-%d{yyyy-MM-dd}.%i.log</FileNamePattern></rollingPolicy></appender>\
+         <appender name=\"HTML\"><file>${LOG_HOME}/error-log.html</file></appender></configuration>",
+    )
+    .unwrap();
+    fs::write(
+        sys_dir.join("src/main/resources/application.yml"),
+        "spring:\n  application:\n    name: synergy-system\n",
+    )
+    .unwrap();
+    fs::write(
+        gw_dir.join("src/main/resources/logback-spring.xml"),
+        "<configuration><property name=\"LOG_HOME\" value=\"../logs\" />\
+         <appender name=\"FILE\"><rollingPolicy><FileNamePattern>${LOG_HOME}/jeecg-gateway-%d{yyyy-MM-dd}.%i.log</FileNamePattern></rollingPolicy></appender></configuration>",
+    )
+    .unwrap();
+    fs::write(
+        gw_dir.join("src/main/resources/application.yml"),
+        "spring:\n  application:\n    name: synergy-gateway\n",
+    )
+    .unwrap();
+    fs::write(
+        file_dir.join("src/main/resources/logback-spring.xml"),
+        "<configuration><property name=\"LOG_HOME\" value=\"../logs\" />\
+         <appender name=\"FILE\"><rollingPolicy><FileNamePattern>${LOG_HOME}/jeecg-demo-%d{yyyy-MM-dd}.%i.log</FileNamePattern></rollingPolicy></appender></configuration>",
+    )
+    .unwrap();
+
+    // Only system and demo logs exist in shared ../logs; gateway has none.
+    fs::write(logs.join("jeecg-system-2026-11-24.0.log"), "system line\n").unwrap();
+    fs::write(logs.join("jeecg-demo-2026-11-13.0.log"), "demo line\n").unwrap();
+
+    let found_sys = crate::scan::project::find_log_file(
+        Some(&sys_dir),
+        Some("sys-cloud-start"),
+        Some("org.jeecg.JeecgSystemCloudApplication"),
+        Some("JeecgSystemCloudApplication"),
+        None,
+        None,
+        std::slice::from_ref(&tmp),
+    );
+    assert!(
+        found_sys
+            .as_ref()
+            .is_some_and(|p| p.ends_with("jeecg-system-2026-11-24.0.log")),
+        "system must pick its own log: {found_sys:?}"
+    );
+
+    let found_file = crate::scan::project::find_log_file(
+        Some(&file_dir),
+        Some("file-cloud-start"),
+        Some("org.jeecg.JeecgFileCloudApplication"),
+        Some("JeecgFileCloudApplication"),
+        None,
+        None,
+        std::slice::from_ref(&tmp),
+    );
+    assert!(
+        found_file
+            .as_ref()
+            .is_some_and(|p| p.ends_with("jeecg-demo-2026-11-13.0.log")),
+        "file service must pick its own log: {found_file:?}"
+    );
+
+    let found_gw = crate::scan::project::find_log_file(
+        Some(&gw_dir),
+        Some("cloud-gateway"),
+        Some("org.jeecg.JeecgGatewayApplication"),
+        Some("JeecgGatewayApplication"),
+        None,
+        None,
+        std::slice::from_ref(&tmp),
+    );
+    assert!(
+        found_gw.is_none(),
+        "gateway with no log must not hijack sibling jeecg-system log: {found_gw:?}"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn spring_config_extracts_nested_yaml_and_properties_log_settings() {
+    use std::fs;
+    let tmp = std::env::temp_dir().join(format!("tspb-cfg-log-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let mod_yml = tmp.join("yml-svc");
+    let mod_props = tmp.join("props-svc");
+    let custom_logs = tmp.join("custom-logs");
+    fs::create_dir_all(mod_yml.join("src/main/resources")).unwrap();
+    fs::create_dir_all(mod_props.join("src/main/resources")).unwrap();
+    fs::create_dir_all(&custom_logs).unwrap();
+
+    fs::write(
+        mod_yml.join("src/main/resources/application.yml"),
+        format!(
+            "spring:\n  application:\n    name: order-svc\nlogging:\n  file:\n    name: {}/order-out.log\n",
+            custom_logs.to_string_lossy().replace('\\', "/")
+        ),
+    )
+    .unwrap();
+    fs::write(custom_logs.join("order-out.log"), "started\n").unwrap();
+
+    let found_yml = crate::scan::project::find_log_file(
+        Some(&mod_yml),
+        Some("yml-svc"),
+        None,
+        None,
+        None,
+        None,
+        &[],
+    );
+    assert!(
+        found_yml
+            .as_ref()
+            .is_some_and(|p| p.ends_with("order-out.log")),
+        "nested YAML logging.file.name must resolve: {found_yml:?}"
+    );
+
+    fs::write(
+        mod_props.join("src/main/resources/application.properties"),
+        format!(
+            "spring.application.name=bill-svc\nlogging.file.path={}\n",
+            custom_logs.to_string_lossy().replace('\\', "/")
+        ),
+    )
+    .unwrap();
+    fs::write(custom_logs.join("bill-svc.log"), "billing\n").unwrap();
+
+    let found_props = crate::scan::project::find_log_file(
+        Some(&mod_props),
+        Some("props-svc"),
+        None,
+        None,
+        None,
+        None,
+        &[],
+    );
+    assert!(
+        found_props
+            .as_ref()
+            .is_some_and(|p| p.ends_with("bill-svc.log")),
+        "application.properties spring.application.name + logging.file.path must resolve: {found_props:?}"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn process_scan_extracts_sb3_launcher_jar_and_strips_unc() {
+    use crate::scan::process::extract_main_class;
+    assert_eq!(
+        extract_main_class(&[
+            "java".into(),
+            "-cp".into(),
+            "app.jar".into(),
+            "org.springframework.boot.loader.launch.JarLauncher".into(),
+        ]),
+        Some((
+            "org.springframework.boot.loader.launch.JarLauncher".into(),
+            Some("app".into())
+        ))
+    );
+    assert_eq!(
+        extract_main_class(&[
+            "java".into(),
+            "-Xmx512m".into(),
+            "-jar".into(),
+            "/opt/apps/synergy-gateway.jar".into(),
+            "--server.port=9999".into(),
+        ]),
+        Some(("synergy-gateway".into(), Some("synergy-gateway".into())))
+    );
+    assert_eq!(
+        extract_main_class(&[
+            "java".into(),
+            "-cp".into(),
+            "classes".into(),
+            "org.jeecg.JeecgSystemCloudApplication".into(),
+            "server".into(),
+        ]),
+        Some(("org.jeecg.JeecgSystemCloudApplication".into(), None))
+    );
+    assert_eq!(
+        crate::scan::strip_unc_prefix(std::path::Path::new(r"\\?\C:\Users\demo\.jdks\jdk17")),
+        PathBuf::from(r"C:\Users\demo\.jdks\jdk17")
+    );
+}
+
+#[test]
+fn gradle_project_uses_gradlew_and_not_mvnw() {
+    let project = Project {
+        name: "gradle-svc".into(),
+        path: PathBuf::from("/work/gradle-svc"),
+        build: BuildTool::Gradle,
+        has_wrapper: true,
+        main_class: Some("com.example.App".into()),
+        java_version: Some(17),
+        launch_configs: vec![launch_config("bootRun", "auto")],
+        origin: Origin::Project,
+    };
+    let maven = Maven {
+        name: "mvn".into(),
+        home: PathBuf::from("/opt/mvn"),
+        version: "3.9".into(),
+        executable: PathBuf::from("/opt/mvn/bin/mvn"),
+        origin: Origin::Env,
+        wrapper: false,
+    };
+    let (program, args) = crate::runner::build_invocation(
+        &project,
+        &project.launch_configs[0],
+        Some(&maven),
+        &Config::default(),
+    );
+    let pname = program.file_name().unwrap().to_string_lossy();
+    assert!(
+        pname.starts_with("gradlew"),
+        "gradle project must invoke gradlew, got {pname}"
+    );
+    assert!(args.iter().any(|a| a == "bootRun"));
 }

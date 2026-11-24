@@ -61,6 +61,8 @@ pub struct LaunchConfig {
     pub name: String,
     pub main_class: Option<String>,
     pub module_dir: Option<PathBuf>,
+    pub idea_module: Option<String>,
+    pub jre_name: Option<String>,
     pub vm_options: String,
     pub program_args: String,
     pub active_profiles: String,
