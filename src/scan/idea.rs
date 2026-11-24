@@ -295,7 +295,10 @@ fn read_recent_projects(path: &Path, roots: &mut Vec<PathBuf>) {
                     None
                 };
                 if let Some(v) = raw_path
-                    && (v.contains('$') || v.starts_with('/') || v.contains(":\\"))
+                    && (v.contains('$')
+                        || v.starts_with('/')
+                        || v.contains(":\\")
+                        || v.contains(":/"))
                 {
                     let p = expand_idea_macros(&v, None);
                     if p.is_dir() || v.contains("$USER_HOME$") {

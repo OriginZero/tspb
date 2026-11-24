@@ -88,13 +88,16 @@ pub fn scan_tracked(rep: &Reporter) -> Vec<RunningApp> {
     out
 }
 
-/// Returns (main class, optional jar label for `-jar` launches).
-fn extract_main_class(cmd: &[String]) -> Option<(String, Option<String>)> {
-    // Spring Boot fat jar / war launchers.
+/// Returns (main class or jar stem, optional jar label for `-jar` launches).
+pub(crate) fn extract_main_class(cmd: &[String]) -> Option<(String, Option<String>)> {
+    // Spring Boot fat jar / war launchers (SB2 and SB3.2+).
     for launcher in [
         "org.springframework.boot.loader.JarLauncher",
         "org.springframework.boot.loader.PropertiesLauncher",
         "org.springframework.boot.loader.WarLauncher",
+        "org.springframework.boot.loader.launch.JarLauncher",
+        "org.springframework.boot.loader.launch.PropertiesLauncher",
+        "org.springframework.boot.loader.launch.WarLauncher",
     ] {
         if cmd.iter().any(|a| a == launcher) {
             let jar = cmd
@@ -108,29 +111,51 @@ fn extract_main_class(cmd: &[String]) -> Option<(String, Option<String>)> {
         }
     }
 
-    // Plain `java [opts] com.example.DemoApplication` (typical IDEA run configuration).
+    // `java [opts] -jar app.jar [args...]`
+    if let Some(w) = cmd.windows(2).find(|w| w[0] == "-jar") {
+        let p = PathBuf::from(&w[1]);
+        if let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().into_owned())
+            && !stem.is_empty()
+        {
+            return Some((stem.clone(), Some(stem)));
+        }
+    }
+
+    // Plain `java [opts] com.example.DemoApplication [args...]` (typical IDEA run configuration).
     let mut skip_next = false;
-    for (i, arg) in cmd.iter().enumerate().skip(1) {
+    for arg in cmd.iter().skip(1) {
         if skip_next {
             skip_next = false;
             continue;
         }
-        if ["-cp", "-classpath", "--class-path", "-p", "--module-path"].contains(&arg.as_str()) {
+        if [
+            "-cp",
+            "-classpath",
+            "--class-path",
+            "-p",
+            "--module-path",
+            "-m",
+            "--module",
+            "--add-opens",
+            "--add-exports",
+            "--add-reads",
+            "--patch-module",
+            "--upgrade-module-path",
+        ]
+        .contains(&arg.as_str())
+        {
             skip_next = true;
             continue;
         }
         if arg.starts_with('-') || arg.starts_with('@') {
             continue;
         }
-        // Last positional argument is the main class; require a dotted package name.
-        let is_last = !cmd[i + 1..]
-            .iter()
-            .any(|a| !a.starts_with('-') && !a.contains('=') && !a.contains('/'));
-        if is_last
-            && arg.contains('.')
+        // First positional argument after JVM options is the main class; require a dotted package name.
+        if arg.contains('.')
             && !arg.ends_with(".jar")
             && !arg.contains('\\')
             && !arg.contains('/')
+            && !arg.contains('=')
             && arg.chars().next().is_some_and(|c| c.is_ascii_lowercase())
         {
             return Some((arg.clone(), None));

@@ -179,7 +179,7 @@ pub fn home_from_java_exe(path: &Path) -> Option<PathBuf> {
     let bin = resolved.parent()?;
     let home = bin.parent()?;
     if home.join("bin").join(exe("java")).exists() || home.join("release").exists() {
-        Some(home.to_path_buf())
+        Some(super::strip_unc_prefix(home))
     } else {
         None
     }

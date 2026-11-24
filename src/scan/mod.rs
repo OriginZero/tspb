@@ -208,11 +208,22 @@ pub fn push_unique_maven(list: &mut Vec<Maven>, item: Maven) {
     }
 }
 
+/// Strip Windows extended-length path prefixes (`\\?\`, `\\?\UNC\`) produced by `fs::canonicalize`.
+pub fn strip_unc_prefix(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        p.to_path_buf()
+    }
+}
+
 fn normalize(p: &Path) -> String {
     let canonical = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    canonical
+    strip_unc_prefix(&canonical)
         .to_string_lossy()
-        .trim_start_matches(r"\\?\")
         .replace('\\', "/")
         .to_lowercase()
 }
