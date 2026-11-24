@@ -1,4 +1,6 @@
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 
 /// Semantic actions, independent of whether they came from a prefix chord,
 /// a direct key, or a mouse event.
@@ -73,6 +75,7 @@ pub fn translate(ev: Event, prefix_active: bool, editing: bool, prefix_char: cha
         // keyboard-enhancement terminals additionally emit Repeat while held.
         // Only the initial press is a user action.
         Event::Key(k) if !matches!(k.kind, KeyEventKind::Press) => Action::Ignored,
+        Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved) => Action::Ignored,
         Event::Mouse(m) => Action::Mouse(m),
         Event::Resize(_, _) => Action::None,
         Event::Key(k) => translate_key(k, prefix_active, editing, prefix_char),

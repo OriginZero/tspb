@@ -363,10 +363,19 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut app::Ap
     loop {
         terminal.draw(|f| ui::render(f, app))?;
         let tick = Duration::from_millis(app.cfg.tick_ms.max(50));
-        if poll(tick)? {
+        let deadline = Instant::now() + tick;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !poll(remaining)? {
+                break;
+            }
             let ev = read()?;
             let action = event::translate(ev, app.prefix_active, app.is_editing(), app.prefix_char);
+            if action == event::Action::Ignored {
+                continue;
+            }
             app.handle(action);
+            break;
         }
         app.tick();
         if app.should_quit {
