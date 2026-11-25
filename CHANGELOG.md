@@ -4,6 +4,38 @@ All notable changes to tspb are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-11-25
+
+### Added
+
+- **OS listening port discovery for running processes.** Process scanning now
+  collects active TCP listening sockets (`netstat` on Windows / `lsof` on Unix,
+  with lightweight caching) alongside command-line `--server.port` flags,
+  surfacing Nacos/config-assigned ports (e.g. `:7001`, `:7017`) in `RUNNING`.
+
+### Fixed
+
+- **Maven/Gradle child JVM deduplication across sibling modules.** `RunningApp`
+  records OS parent-process chains (`ancestor_pids`), resolves
+  `-Dmaven.multiModuleProjectDirectory=` from ancestor Maven launchers, and
+  falls back to `@*.argfile` module classpath entries (`target/classes`,
+  `build/classes/...`). Managed processes now deduplicate reliably even when
+  sibling modules share an identical `@SpringBootApplication` main class and no
+  `-Duser.dir=` is set.
+- **Switching `RUNNING` services always updates the `LOG` view.** Rows carrying a
+  live `pid` no longer inherit the previously viewed service's `selected_log_id`
+  when they have no log file of their own, and external processes no longer
+  borrow another run's managed buffer via `find_by_project`. Selection moves
+  sync target stream state immediately, `find_by_project` prefers active runs,
+  and `row_key` keeps `PROJECTS` cursor selection stable across launches.
+- **Per-PID log isolation for shared Logback files.** When multiple external
+  `[SYSTEM]` services write to the same Logback file (e.g. copied
+  `jeecg-system-%d.log` patterns), switching PIDs now resets scroll/follow
+  state via `(shown_log_id, shown_log_pid)` and filters lines per service using
+  exclusive listening ports (such as `[http-nio-7017-*]` vs `[http-nio-7001-*]`),
+  PID markers, unique main class / `spring.application.name`, and attached
+  stacktrace continuations, while reporting matched counts in `DETAIL` and `LOG`.
+
 ## [0.3.2] - 2026-11-24
 
 ### Added
