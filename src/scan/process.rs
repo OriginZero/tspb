@@ -1,7 +1,10 @@
 use crate::model::{Origin, RunningApp};
 use crate::progress::Reporter;
 use crate::scan::env::home_from_java_exe;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 /// Java processes that are NOT Spring Boot applications (IDE helpers, build daemons).
@@ -65,14 +68,18 @@ pub fn scan_tracked(rep: &Reporter) -> Vec<RunningApp> {
                 .unwrap_or(&main_class)
                 .to_string(),
         };
+        let (ancestor_pids, mvn_dir) = collect_ancestors_and_mvn_dir(&sys, *pid);
         let jdk_home = cmd
             .first()
             .and_then(|s| home_from_java_exe(&PathBuf::from(s.trim_matches('"'))));
-        let work_dir = extract_work_dir(&cmd);
+        let work_dir = extract_work_dir(&cmd)
+            .or(mvn_dir)
+            .or_else(|| extract_work_dir_from_argfile(&cmd));
         let ports = extract_ports(&joined);
 
         out.push(RunningApp {
             pid: pid.as_u32(),
+            ancestor_pids,
             main_class,
             name,
             jdk_home,
@@ -84,6 +91,7 @@ pub fn scan_tracked(rep: &Reporter) -> Vec<RunningApp> {
         });
     }
     out.sort_by_key(|a| a.name.to_lowercase());
+    enrich_listening_ports(&mut out);
     rep.running(out.len());
     out
 }
@@ -164,10 +172,88 @@ pub(crate) fn extract_main_class(cmd: &[String]) -> Option<(String, Option<Strin
     None
 }
 
+fn collect_ancestors_and_mvn_dir(
+    sys: &System,
+    start_pid: sysinfo::Pid,
+) -> (Vec<u32>, Option<PathBuf>) {
+    let mut ancestors = Vec::new();
+    let mut mvn_dir = None;
+    let mut cur = start_pid;
+    for _ in 0..8 {
+        let Some(ppid) = sys.process(cur).and_then(|p| p.parent()) else {
+            break;
+        };
+        let raw_id = ppid.as_u32();
+        if raw_id == 0 || ancestors.contains(&raw_id) {
+            break;
+        }
+        ancestors.push(raw_id);
+        if mvn_dir.is_none()
+            && let Some(parent) = sys.process(ppid)
+        {
+            for arg in parent.cmd() {
+                let s = arg.to_string_lossy();
+                let clean = s.trim_matches('"').trim_matches('\'');
+                if let Some(dir) = clean.strip_prefix("-Dmaven.multiModuleProjectDirectory=")
+                    && !dir.is_empty()
+                {
+                    mvn_dir = Some(PathBuf::from(dir));
+                    break;
+                }
+            }
+        }
+        cur = ppid;
+    }
+    (ancestors, mvn_dir)
+}
+
 fn extract_work_dir(cmd: &[String]) -> Option<PathBuf> {
     for a in cmd {
         if let Some(v) = a.strip_prefix("-Duser.dir=") {
             return Some(PathBuf::from(v));
+        }
+    }
+    None
+}
+
+/// Spring Boot Maven plugin and IDEA shorten long classpaths via `@argfile`.
+/// The first entry is the module's own `target/classes` (or `build/classes/...`),
+/// which identifies the exact module even when multiple modules share a main class.
+pub(crate) fn extract_work_dir_from_argfile(cmd: &[String]) -> Option<PathBuf> {
+    use std::io::Read;
+
+    let argfile = cmd
+        .iter()
+        .find_map(|a| a.trim_matches('"').strip_prefix('@'))?;
+    let mut file = std::fs::File::open(argfile).ok()?;
+    let mut buf = vec![0u8; 8192];
+    let n = file.read(&mut buf).ok()?;
+    let raw = String::from_utf8_lossy(&buf[..n]);
+    parse_module_dir_from_classpath(&raw)
+}
+
+pub(crate) fn parse_module_dir_from_classpath(raw: &str) -> Option<PathBuf> {
+    let unescaped = raw.replace("\\\\", "\\").replace('"', "");
+    let sep_split = unescaped.split(|c: char| {
+        c == ';' || c == '\n' || c == '\r' || c == '\t' || c == ' ' || (!cfg!(windows) && c == ':')
+    });
+    for entry in sep_split {
+        let norm = entry.trim().replace('\\', "/");
+        for suffix in [
+            "/target/classes",
+            "/build/classes/java/main",
+            "/build/classes/kotlin/main",
+        ] {
+            if let Some(base) = norm.strip_suffix(suffix)
+                && !base.is_empty()
+            {
+                let native = if cfg!(windows) {
+                    base.replace('/', "\\")
+                } else {
+                    base.to_string()
+                };
+                return Some(PathBuf::from(native));
+            }
         }
     }
     None
@@ -186,4 +272,139 @@ fn extract_ports(joined: &str) -> Vec<u16> {
         }
     }
     ports
+}
+
+struct ListeningPortCache {
+    fetched_at: Instant,
+    ports: HashMap<u32, Vec<u16>>,
+}
+
+static LISTENING_PORTS: OnceLock<Mutex<ListeningPortCache>> = OnceLock::new();
+
+fn enrich_listening_ports(apps: &mut [RunningApp]) {
+    if apps.is_empty() {
+        return;
+    }
+    let cache_lock = LISTENING_PORTS.get_or_init(|| {
+        Mutex::new(ListeningPortCache {
+            fetched_at: Instant::now() - Duration::from_secs(60),
+            ports: HashMap::new(),
+        })
+    });
+    let Ok(mut cache) = cache_lock.lock() else {
+        return;
+    };
+    let has_unseen = apps.iter().any(|a| !cache.ports.contains_key(&a.pid));
+    let any_empty = apps
+        .iter()
+        .any(|a| a.ports.is_empty() && cache.ports.get(&a.pid).is_none_or(Vec::is_empty));
+    let ttl = if any_empty {
+        Duration::from_secs(3)
+    } else {
+        Duration::from_secs(15)
+    };
+    if has_unseen || cache.fetched_at.elapsed() >= ttl {
+        cache.ports = collect_listening_ports();
+        cache.fetched_at = Instant::now();
+    }
+    for app in apps {
+        if let Some(os_ports) = cache.ports.get(&app.pid) {
+            for &p in os_ports {
+                if !app.ports.contains(&p) {
+                    app.ports.push(p);
+                }
+            }
+        }
+    }
+}
+
+fn collect_listening_ports() -> HashMap<u32, Vec<u16>> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let Ok(out) = Command::new("netstat")
+            .args(["-ano", "-p", "TCP"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        else {
+            return HashMap::new();
+        };
+        let raw = String::from_utf8_lossy(&out.stdout);
+        parse_netstat_listening(&raw)
+    }
+    #[cfg(unix)]
+    {
+        use std::process::Command;
+
+        if let Ok(out) = Command::new("lsof")
+            .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-Fn", "-Fp"])
+            .output()
+            && out.status.success()
+        {
+            return parse_lsof_listening(&String::from_utf8_lossy(&out.stdout));
+        }
+        HashMap::new()
+    }
+}
+
+pub(crate) fn parse_netstat_listening(raw: &str) -> HashMap<u32, Vec<u16>> {
+    let mut map: HashMap<u32, Vec<u16>> = HashMap::new();
+    for line in raw.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 5 || !cols[0].eq_ignore_ascii_case("TCP") {
+            continue;
+        }
+        let foreign_unbound = cols[2] == "0.0.0.0:0" || cols[2] == "[::]:0";
+        let state_listen = cols[3].eq_ignore_ascii_case("LISTENING")
+            || cols[3].eq_ignore_ascii_case("LISTEN")
+            || cols[3] == "侦听";
+        if !foreign_unbound && !state_listen {
+            continue;
+        }
+        let Some((_, port_str)) = cols[1].rsplit_once(':') else {
+            continue;
+        };
+        let (Ok(port), Ok(pid)) = (port_str.parse::<u16>(), cols[4].parse::<u32>()) else {
+            continue;
+        };
+        if port == 0 || pid == 0 {
+            continue;
+        }
+        let entry = map.entry(pid).or_default();
+        if !entry.contains(&port) {
+            entry.push(port);
+        }
+    }
+    for ports in map.values_mut() {
+        ports.sort_unstable();
+    }
+    map
+}
+
+#[cfg(unix)]
+fn parse_lsof_listening(raw: &str) -> HashMap<u32, Vec<u16>> {
+    let mut map: HashMap<u32, Vec<u16>> = HashMap::new();
+    let mut cur_pid = None;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix('p') {
+            cur_pid = rest.trim().parse::<u32>().ok();
+        } else if let Some(rest) = line.strip_prefix('n')
+            && let Some(pid) = cur_pid
+            && let Some((_, port_str)) = rest.rsplit_once(':')
+            && let Ok(port) = port_str.trim().parse::<u16>()
+            && port > 0
+        {
+            let entry = map.entry(pid).or_default();
+            if !entry.contains(&port) {
+                entry.push(port);
+            }
+        }
+    }
+    for ports in map.values_mut() {
+        ports.sort_unstable();
+    }
+    map
 }

@@ -81,6 +81,7 @@ fn fake_inventory() -> Inventory {
         ],
         running: vec![RunningApp {
             pid: 4242,
+            ancestor_pids: vec![],
             main_class: "com.example.DemoApplication".into(),
             name: "DemoApplication".into(),
             jdk_home: Some(PathBuf::from("/opt/jdk17")),
@@ -1698,6 +1699,7 @@ fn managed_app_deduplicates_scanned_java_process_and_inherits_ports() {
     // Add a simulated unmanaged system Java process matching this project
     app.inv.running = vec![RunningApp {
         pid: 99999,
+        ancestor_pids: vec![],
         main_class: "com.example.DemoApplication".into(),
         name: "DemoApplication".into(),
         jdk_home: None,
@@ -1776,6 +1778,7 @@ fn unmanaged_running_app_discovers_log_file_and_streams_it() {
     app.inv.projects.push(project);
     app.inv.running.push(RunningApp {
         pid: 12345,
+        ancestor_pids: vec![],
         main_class: "com.example.DemoAppApplication".into(),
         name: "DemoAppApplication".into(),
         jdk_home: None,
@@ -2281,6 +2284,7 @@ fn view_counts_cjk_wrapping_and_scrolled_mouse_click_stay_consistent() {
     // Managed process + deduped running app should count once in Running.
     app.inv.running.push(RunningApp {
         pid: 5555,
+        ancestor_pids: vec![],
         main_class: "org.other.OtherApp".into(),
         name: "OtherApp".into(),
         jdk_home: None,
@@ -2315,4 +2319,335 @@ fn view_counts_cjk_wrapping_and_scrolled_mouse_click_stay_consistent() {
     if let Some(r) = target_row {
         assert_eq!(app.selected, r);
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn descendant_process_dedups_even_when_sibling_modules_share_main_class() {
+    let jdk = Jdk {
+        name: "test-jdk".into(),
+        home: std::env::temp_dir(),
+        version: "17".into(),
+        java: PathBuf::from("java.exe"),
+        origin: Origin::Env,
+    };
+    let mut runner = Runner::new(100);
+    let (proj_b, id_b) = fake_service("mod-part-cloud-start", "PART_OK", &jdk, &mut runner);
+    let mut proj_a = proj_b.clone();
+    proj_a.name = "mod-part-start".into();
+    proj_a.path = proj_b.path.with_file_name("mod-part-start");
+    let shared_main = "org.jeecg.JeecgPartCloudApplication".to_string();
+    proj_a.main_class = Some(shared_main.clone());
+    let mut proj_b = proj_b;
+    proj_b.main_class = Some(shared_main.clone());
+
+    wait_for_line(&mut runner, &id_b, "PART_OK");
+    let managed_pid = runner.managed[&id_b].pid;
+
+    let mut app = test_app();
+    // Alphabetically proj_a comes first and shares the exact same main_class with no IDEA config.
+    app.inv.projects = vec![proj_a, proj_b.clone()];
+    app.runner = runner;
+    app.inv.running = vec![RunningApp {
+        pid: 88888,
+        ancestor_pids: vec![77777, managed_pid],
+        main_class: shared_main,
+        name: "JeecgPartCloudApplication".into(),
+        jdk_home: None,
+        work_dir: None,
+        ports: vec![7020],
+        cmdline: "java -cp @temp.argfile org.jeecg.JeecgPartCloudApplication".into(),
+        managed: false,
+        origin: Origin::System,
+    }];
+    app.rebuild_rows();
+
+    let running_rows: Vec<_> = app.rows.iter().filter(|r| r.group == "RUNNING").collect();
+    assert_eq!(
+        running_rows.len(),
+        1,
+        "child JVM spawned under managed pid must dedup regardless of duplicate main_class: {running_rows:?}"
+    );
+    assert!(running_rows[0].detail.contains(":7020"));
+
+    // Also verify argfile classpath module resolution for detached/external processes.
+    let cp = r#""C:\\repo\\synergy-server-cloud\\synergy-process-cloud-start\\target\\classes;C:\\Users\\x\\.m2\\a.jar""#;
+    assert_eq!(
+        crate::scan::process::parse_module_dir_from_classpath(cp),
+        Some(PathBuf::from(
+            r"C:\repo\synergy-server-cloud\synergy-process-cloud-start"
+        ))
+    );
+
+    let _ = app.stop_managed(&id_b);
+    let _ = std::fs::remove_dir_all(&proj_b.path);
+}
+
+#[test]
+fn switching_to_running_service_without_log_clears_previous_stream() {
+    use std::fs;
+    let tmp = std::env::temp_dir().join(format!("tspb-switch-nolog-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let mod_a = tmp.join("svc-a");
+    let mod_b = tmp.join("svc-b");
+    let logs = tmp.join("logs");
+    fs::create_dir_all(mod_a.join("src/main/resources")).unwrap();
+    fs::create_dir_all(mod_b.join("src/main/resources")).unwrap();
+    fs::create_dir_all(&logs).unwrap();
+
+    fs::write(
+        mod_a.join("src/main/resources/logback-spring.xml"),
+        "<configuration><property name=\"LOG_HOME\" value=\"../logs\" />\
+         <appender name=\"F\"><rollingPolicy><FileNamePattern>${LOG_HOME}/svc-a-%d.log</FileNamePattern></rollingPolicy></appender></configuration>",
+    )
+    .unwrap();
+    fs::write(
+        mod_b.join("src/main/resources/logback-spring.xml"),
+        "<configuration><property name=\"LOG_HOME\" value=\"../logs\" />\
+         <appender name=\"F\"><rollingPolicy><FileNamePattern>${LOG_HOME}/svc-b-%d.log</FileNamePattern></rollingPolicy></appender></configuration>",
+    )
+    .unwrap();
+    fs::write(logs.join("svc-a-2026-11-24.log"), "SVC_A_LINE\n").unwrap();
+
+    let mut app = test_app();
+    app.inv.projects = vec![
+        Project {
+            name: "svc-a".into(),
+            path: mod_a.clone(),
+            build: BuildTool::Maven,
+            has_wrapper: false,
+            main_class: Some("com.example.AppA".into()),
+            java_version: Some(17),
+            launch_configs: vec![],
+            origin: Origin::Project,
+        },
+        Project {
+            name: "svc-b".into(),
+            path: mod_b.clone(),
+            build: BuildTool::Maven,
+            has_wrapper: false,
+            main_class: Some("com.example.AppB".into()),
+            java_version: Some(17),
+            launch_configs: vec![],
+            origin: Origin::Project,
+        },
+    ];
+    app.cfg.scan_roots = vec![tmp.clone()];
+    app.inv.running = vec![
+        RunningApp {
+            pid: 10001,
+            ancestor_pids: vec![],
+            main_class: "com.example.AppA".into(),
+            name: "AppA".into(),
+            jdk_home: None,
+            work_dir: Some(mod_a),
+            ports: vec![8001],
+            cmdline: "java com.example.AppA".into(),
+            managed: false,
+            origin: Origin::System,
+        },
+        RunningApp {
+            pid: 10002,
+            ancestor_pids: vec![],
+            main_class: "com.example.AppB".into(),
+            name: "AppB".into(),
+            jdk_home: None,
+            work_dir: Some(mod_b),
+            ports: vec![8002],
+            cmdline: "java com.example.AppB".into(),
+            managed: false,
+            origin: Origin::System,
+        },
+    ];
+    app.rebuild_rows();
+
+    let row_a = app
+        .rows
+        .iter()
+        .position(|r| r.group == "RUNNING" && r.label == "AppA")
+        .unwrap();
+    let row_b = app
+        .rows
+        .iter()
+        .position(|r| r.group == "RUNNING" && r.label == "AppB")
+        .unwrap();
+
+    // Enter ITEMS and land on AppA: stream points to svc-a log.
+    app.layer = Layer::Content;
+    app.focus = Focus::List;
+    app.selected = row_a;
+    app.tick();
+    assert!(
+        app.current_log_id()
+            .as_deref()
+            .is_some_and(|s| s.contains("svc-a-2026-11-24.log"))
+    );
+
+    // Move to AppB via navigation: AppB has no log file, so AppA's log must NOT stick.
+    let delta = row_b as i32 - row_a as i32;
+    app.handle(Action::Move(delta));
+    assert_eq!(app.selected, row_b);
+    assert!(
+        app.current_log_id().is_none(),
+        "switching to a running app with no log must clear the prior app's log"
+    );
+    app.tick();
+    assert!(app.current_log_id().is_none());
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn shared_file_log_and_immediate_move_sync_are_reported() {
+    use std::fs;
+    let tmp = std::env::temp_dir().join(format!("tspb-shared-flag-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let mod_a = tmp.join("svc-process");
+    let mod_b = tmp.join("svc-system");
+    let logs = tmp.join("logs");
+    fs::create_dir_all(mod_a.join("src/main/resources")).unwrap();
+    fs::create_dir_all(mod_b.join("src/main/resources")).unwrap();
+    fs::create_dir_all(&logs).unwrap();
+
+    for m in [&mod_a, &mod_b] {
+        fs::write(
+            m.join("src/main/resources/logback-spring.xml"),
+            "<configuration><property name=\"LOG_HOME\" value=\"../logs\" />\
+             <appender name=\"F\"><rollingPolicy><FileNamePattern>${LOG_HOME}/jeecg-system-%d.log</FileNamePattern></rollingPolicy></appender></configuration>",
+        )
+        .unwrap();
+    }
+    fs::write(
+        logs.join("jeecg-system-2026-11-24.log"),
+        "\
+2026-11-24 18:44:56.443 [main] INFO  org.jeecg.SystemApp:53 - Starting SystemApp with PID 20002\n\
+2026-11-24 18:44:59.693 [main] INFO  org.jeecg.ProcessApp:53 - Starting ProcessApp with PID 20001\n\
+2026-11-24 18:59:14.024 [http-nio-7017-exec-6] INFO  FlowDefinitionServiceImpl - FLOWABLE_PROCESS_ONLY\n\
+\tat com.example.Flow.run(Flow.java:10)\n\
+2026-11-24 18:59:14.928 [http-nio-7001-exec-5] INFO  SysUserServiceImpl - SYSTEM_USER_ONLY\n\
+2026-11-24 19:39:32.887 [nacos-grpc] INFO  naming - new ips(1) DEFAULT_GROUP@@svc-system port:7001\n",
+    )
+    .unwrap();
+
+    let mut app = test_app();
+    app.cfg.scan_roots = vec![tmp.clone()];
+    app.inv.projects = vec![
+        Project {
+            name: "svc-process".into(),
+            path: mod_a.clone(),
+            build: BuildTool::Maven,
+            has_wrapper: false,
+            main_class: Some("org.jeecg.ProcessApp".into()),
+            java_version: Some(17),
+            launch_configs: vec![],
+            origin: Origin::Project,
+        },
+        Project {
+            name: "svc-system".into(),
+            path: mod_b.clone(),
+            build: BuildTool::Maven,
+            has_wrapper: false,
+            main_class: Some("org.jeecg.SystemApp".into()),
+            java_version: Some(17),
+            launch_configs: vec![],
+            origin: Origin::Project,
+        },
+    ];
+    app.inv.running = vec![
+        RunningApp {
+            pid: 20001,
+            ancestor_pids: vec![],
+            main_class: "org.jeecg.ProcessApp".into(),
+            name: "ProcessApp".into(),
+            jdk_home: None,
+            work_dir: Some(mod_a),
+            ports: vec![7017],
+            cmdline: "java org.jeecg.ProcessApp".into(),
+            managed: false,
+            origin: Origin::System,
+        },
+        RunningApp {
+            pid: 20002,
+            ancestor_pids: vec![],
+            main_class: "org.jeecg.SystemApp".into(),
+            name: "SystemApp".into(),
+            jdk_home: None,
+            work_dir: Some(mod_b),
+            ports: vec![7001],
+            cmdline: "java org.jeecg.SystemApp".into(),
+            managed: false,
+            origin: Origin::System,
+        },
+    ];
+    app.rebuild_rows();
+    app.layer = Layer::Content;
+    app.focus = Focus::List;
+    let row_proc = app
+        .rows
+        .iter()
+        .position(|r| r.group == "RUNNING" && r.label == "ProcessApp")
+        .unwrap();
+    let row_sys = app
+        .rows
+        .iter()
+        .position(|r| r.group == "RUNNING" && r.label == "SystemApp")
+        .unwrap();
+
+    // Selecting ProcessApp (pid 20001, :7017) filters to process lines + stacktrace.
+    app.selected = row_proc;
+    app.tick();
+    let id = app.current_log_id().expect("shared log file resolved");
+    assert!(app.shared_log_counts(&id).is_some());
+    let proc_logs = app.logs_for(&id);
+    assert!(
+        proc_logs
+            .iter()
+            .any(|l| l.contains("FLOWABLE_PROCESS_ONLY"))
+    );
+    assert!(proc_logs.iter().any(|l| l.contains("Flow.run")));
+    assert!(!proc_logs.iter().any(|l| l.contains("SYSTEM_USER_ONLY")));
+
+    // Freeze scroll on ProcessApp, then switch to SystemApp (pid 20002, :7001):
+    // both log content AND shown_log_pid + log_follow must update immediately.
+    app.log_follow = false;
+    app.handle(Action::Move(row_sys as i32 - row_proc as i32));
+    assert_eq!(app.shown_log_pid, Some(20002));
+    assert!(app.log_follow);
+    let sys_logs = app.logs_for(&id);
+    assert!(sys_logs.iter().any(|l| l.contains("SYSTEM_USER_ONLY")));
+    assert!(!sys_logs.iter().any(|l| l.contains("FLOWABLE_PROCESS_ONLY")));
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        screen.contains("shared"),
+        "shared external log must be clearly flagged in DETAIL/LOG title"
+    );
+    assert!(screen.contains("SYSTEM_USER_ONLY"));
+    assert!(!screen.contains("FLOWABLE_PROCESS_ONLY"));
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn parse_netstat_extracts_listening_ports_per_pid() {
+    let sample = "\
+  Proto  Local Address          Foreign Address        State           PID\n\
+  TCP    0.0.0.0:7001           0.0.0.0:0              LISTENING       10724\n\
+  TCP    0.0.0.0:7017           0.0.0.0:0              LISTENING       32632\n\
+  TCP    [::]:8720              [::]:0                 侦听            32632\n\
+  TCP    192.168.10.1:50000     10.0.0.3:3306          ESTABLISHED     10724\n";
+    let parsed = crate::scan::process::parse_netstat_listening(sample);
+    assert_eq!(parsed.get(&10724).map(Vec::as_slice), Some(&[7001][..]));
+    assert_eq!(
+        parsed.get(&32632).map(Vec::as_slice),
+        Some(&[7017, 8720][..])
+    );
 }

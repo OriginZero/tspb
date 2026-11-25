@@ -144,14 +144,16 @@ pub struct App {
     pub active_maven: usize,
     pub active_config: HashMap<String, usize>,
     pub selected_log_id: Option<String>,
+    pub selected_log_pid: Option<u32>,
     pub file_logs: HashMap<String, FileLogState>,
     log_file_cache: LogFileCache,
     pub log_follow: bool,
     pub log_scroll: usize,
     /// Absolute index of the yank/scroll cursor inside the log ring buffer.
     pub log_cursor: usize,
-    /// The stream the LOG pane showed last tick; a change resets scroll/follow.
+    /// The stream and pid the LOG pane showed last tick; a change resets scroll/follow.
     pub shown_log_id: Option<String>,
+    pub shown_log_pid: Option<u32>,
     /// `v` anchors a visual line selection; `y` yanks anchor..cursor.
     pub visual_anchor: Option<usize>,
     /// Last yanked text (also the fallback when no OS clipboard is reachable).
@@ -219,12 +221,14 @@ impl App {
             active_maven: 0,
             active_config: HashMap::new(),
             selected_log_id: None,
+            selected_log_pid: None,
             file_logs: HashMap::new(),
             log_file_cache: RefCell::new(HashMap::new()),
             log_follow: true,
             log_scroll: 0,
             log_cursor: 0,
             shown_log_id: None,
+            shown_log_pid: None,
             visual_anchor: None,
             clipboard: None,
             log_view_height: 10,
@@ -366,16 +370,24 @@ impl App {
             .position(|p| p.name.eq_ignore_ascii_case(&app.name))
     }
 
+    fn managed_matches_running(&self, m: &crate::runner::Managed, a: &RunningApp) -> bool {
+        if a.pid == m.pid || a.ancestor_pids.contains(&m.pid) {
+            return true;
+        }
+        if let Some(wd) = a.work_dir.as_deref() {
+            return wd == m.project_path.as_path();
+        }
+        self.match_running_project(a)
+            .is_some_and(|pi| self.inv.projects[pi].path == m.project_path)
+    }
+
     fn is_deduped_running_app(&self, a: &RunningApp) -> bool {
         if self.runner.find_by_pid(a.pid).is_some() {
             return true;
         }
         self.runner.managed.values().any(|m| {
             matches!(m.state, RunState::Starting | RunState::Running)
-                && (self
-                    .match_running_project(a)
-                    .is_some_and(|pi| self.inv.projects[pi].path == m.project_path)
-                    || a.work_dir.as_deref() == Some(&m.project_path))
+                && self.managed_matches_running(m, a)
         })
     }
 
@@ -403,12 +415,7 @@ impl App {
                     .running
                     .iter()
                     .find_map(|a| {
-                        let is_match = a.pid == m.pid
-                            || (self
-                                .match_running_project(a)
-                                .is_some_and(|pi| self.inv.projects[pi].path == m.project_path))
-                            || a.work_dir.as_deref() == Some(&m.project_path);
-                        if is_match && !a.ports.is_empty() {
+                        if self.managed_matches_running(m, a) && !a.ports.is_empty() {
                             Some(format!(
                                 " · :{}",
                                 a.ports
@@ -713,37 +720,115 @@ impl App {
 
     /// The stream the LOG pane renders. The selected row wins, so moving the
     /// cursor over a RUNNING entry switches the pane immediately; the pid match
-    /// keeps two launch configs of the same module apart. `selected_log_id` is
-    /// only a fallback for rows that carry no stream (JDK / Maven / idle project),
-    /// which keeps the pane from blanking out while you browse toolchains.
+    /// keeps two launch configs of the same module apart. Rows that carry their
+    /// own pid never borrow `selected_log_id` from another service if no stream
+    /// is found; only idle projects and toolchain rows keep the previous stream
+    /// so browsing them does not blank the pane.
     pub fn current_log_id(&self) -> Option<String> {
-        let from_row = self.current_row().and_then(|row| match row.kind {
+        let row = self.current_row();
+        let row_has_pid = matches!(
+            row.map(|r| &r.kind),
+            Some(RowKind::App { pid: Some(_), .. })
+        );
+        let from_row = row.and_then(|row| match row.kind {
             RowKind::App { project, pid } => {
-                if let Some(pid) = pid
-                    && let Some(m) = self.runner.find_by_pid(pid)
-                {
-                    return Some(m.id.clone());
+                if let Some(pid) = pid {
+                    if let Some(m) = self.runner.find_by_pid(pid) {
+                        return Some(m.id.clone());
+                    }
+                    return self
+                        .find_log_file_for_row(row)
+                        .map(|p| format!("file://{}", p.display()));
                 }
                 if let Some(pi) = project
                     && let Some(m) = self.runner.find_by_project(&self.inv.projects[pi].path)
                 {
                     return Some(m.id.clone());
                 }
-                if pid.is_some() {
-                    return self
-                        .find_log_file_for_row(row)
-                        .map(|p| format!("file://{}", p.display()));
-                }
                 None
             }
             _ => None,
         });
+        if row_has_pid {
+            return from_row;
+        }
         from_row.or_else(|| {
             self.selected_log_id.clone().filter(|id| {
                 self.runner.managed.contains_key(id)
                     || (id.starts_with("file://") && self.is_live_file_log(id))
             })
         })
+    }
+
+    fn active_log_pid(&self) -> Option<u32> {
+        match self.current_row().map(|r| &r.kind) {
+            Some(RowKind::App { pid, .. }) if pid.is_some() => *pid,
+            Some(RowKind::App { .. }) => self.selected_log_pid,
+            _ => self.selected_log_pid,
+        }
+    }
+
+    fn shared_file_peers(&self, id: &str) -> Vec<SharedPeer> {
+        let Some(target) = id.strip_prefix("file://") else {
+            return Vec::new();
+        };
+        let target_path = Path::new(target);
+        let mut peers = Vec::new();
+        let mut seen_pids = Vec::new();
+        for r in &self.rows {
+            if r.group != "RUNNING" {
+                continue;
+            }
+            let RowKind::App {
+                project,
+                pid: Some(pid),
+            } = r.kind
+            else {
+                continue;
+            };
+            if self.runner.find_by_pid(pid).is_some() || seen_pids.contains(&pid) {
+                continue;
+            }
+            if self
+                .find_log_file_for_row(r)
+                .is_none_or(|p| p != target_path)
+            {
+                continue;
+            }
+            seen_pids.push(pid);
+            let running_app = self.inv.running.iter().find(|a| a.pid == pid);
+            let proj = project.and_then(|pi| self.inv.projects.get(pi));
+            let ports = running_app.map(|a| a.ports.clone()).unwrap_or_default();
+            let main_short = running_app
+                .map(|a| a.main_class.as_str())
+                .or_else(|| proj.and_then(|p| p.main_class.as_deref()))
+                .and_then(|mc| mc.rsplit('.').next())
+                .map(str::to_string);
+            let mut names = Vec::new();
+            if let Some(p) = proj {
+                names.push(p.name.to_lowercase());
+                if let Some(app_name) = crate::scan::project::spring_app_name(&p.path)
+                    && !names.contains(&app_name)
+                {
+                    names.push(app_name);
+                }
+            }
+            if let Some(a) = running_app {
+                let low = a.name.to_lowercase();
+                if !names.contains(&low)
+                    && main_short.as_deref().map(str::to_lowercase).as_deref() != Some(low.as_str())
+                {
+                    names.push(low);
+                }
+            }
+            peers.push(SharedPeer {
+                pid,
+                ports,
+                main_short,
+                names,
+            });
+        }
+        peers
     }
 
     fn is_live_file_log(&self, id: &str) -> bool {
@@ -756,30 +841,59 @@ impl App {
         }
     }
 
+    fn read_raw_file_lines(&self, id: &str) -> Option<Vec<String>> {
+        let path_str = id.strip_prefix("file://")?;
+        if let Some(state) = self.file_logs.get(id) {
+            return Some(state.lines.clone());
+        }
+        Some(crate::scan::project::read_file_tail(Path::new(path_str), 2000).unwrap_or_default())
+    }
+
+    fn filter_shared_lines(&self, id: &str, raw: &[String]) -> Option<Vec<String>> {
+        let peers = self.shared_file_peers(id);
+        if peers.len() < 2 {
+            return None;
+        }
+        let target_pid = self.active_log_pid()?;
+        let target_idx = peers.iter().position(|p| p.pid == target_pid)?;
+        let matchers = build_shared_matchers(&peers);
+        let mut out = Vec::new();
+        let mut active_owner: Option<u32> = None;
+
+        for line in raw {
+            let timestamped = starts_with_log_timestamp(line);
+            if !timestamped {
+                if active_owner == Some(target_pid) {
+                    out.push(line.clone());
+                }
+                continue;
+            }
+            active_owner = classify_shared_line(line, target_idx, &matchers);
+            if active_owner == Some(target_pid) {
+                out.push(line.clone());
+            }
+        }
+        Some(out)
+    }
+
+    pub fn shared_log_counts(&self, id: &str) -> Option<(usize, usize)> {
+        let raw = self.read_raw_file_lines(id)?;
+        let filtered = self.filter_shared_lines(id, &raw)?;
+        Some((filtered.len(), raw.len()))
+    }
+
     pub fn logs_for(&self, id: &str) -> Vec<String> {
-        if let Some(path_str) = id.strip_prefix("file://") {
-            if let Some(state) = self.file_logs.get(id) {
-                return state.lines.clone();
-            }
-            let path = Path::new(path_str);
-            if let Ok(lines) = crate::scan::project::read_file_tail(path, 2000) {
-                return lines;
-            }
-            return Vec::new();
+        if let Some(raw) = self.read_raw_file_lines(id) {
+            return self.filter_shared_lines(id, &raw).unwrap_or(raw);
         }
         self.runner.logs_for(id)
     }
 
     pub fn log_len_of(&self, id: &str) -> usize {
-        if let Some(path_str) = id.strip_prefix("file://") {
-            if let Some(state) = self.file_logs.get(id) {
-                return state.lines.len();
-            }
-            let path = Path::new(path_str);
-            if let Ok(lines) = crate::scan::project::read_file_tail(path, 2000) {
-                return lines.len();
-            }
-            return 0;
+        if let Some(raw) = self.read_raw_file_lines(id) {
+            return self
+                .filter_shared_lines(id, &raw)
+                .map_or(raw.len(), |f| f.len());
         }
         self.runner.log_len(id)
     }
@@ -869,7 +983,7 @@ impl App {
                 if self.layer == Layer::Content && self.focus == Focus::Sidebar {
                     self.set_view(View::ALL[0]);
                 } else {
-                    self.selected = 0;
+                    self.select_row(0);
                 }
                 return;
             }
@@ -879,7 +993,8 @@ impl App {
                         self.set_view(last);
                     }
                 } else {
-                    self.selected = self.rows.len().saturating_sub(1);
+                    let last = self.rows.len().saturating_sub(1);
+                    self.select_row(last);
                 }
                 return;
             }
@@ -917,10 +1032,11 @@ impl App {
             Action::PageDown => self.move_selection(10),
             Action::PageUp => self.move_selection(-10),
             Action::Home => {
-                self.selected = 0;
+                self.select_row(0);
             }
             Action::End => {
-                self.selected = self.rows.len().saturating_sub(1);
+                let last = self.rows.len().saturating_sub(1);
+                self.select_row(last);
             }
             Action::Enter => self.primary_action(),
             Action::Esc => {
@@ -1087,7 +1203,8 @@ impl App {
             Action::Enter => {
                 let items = self.goto_items();
                 if let Some((_, row_idx)) = items.get(self.picker_selected) {
-                    self.selected = *row_idx;
+                    let target = *row_idx;
+                    self.select_row(target);
                     self.enter_pane(Focus::List);
                 }
                 self.mode = Mode::Normal;
@@ -1524,6 +1641,11 @@ impl App {
         self.enter_pane(f);
     }
 
+    fn select_row(&mut self, idx: usize) {
+        self.selected = idx.min(self.rows.len().saturating_sub(1));
+        self.sync_log_target();
+    }
+
     fn move_selection(&mut self, d: i32) {
         match self.focus {
             Focus::Sidebar => {
@@ -1534,7 +1656,8 @@ impl App {
                 }
             }
             Focus::List => {
-                self.selected = clamp_move(self.selected, d, self.rows.len());
+                let next = clamp_move(self.selected, d, self.rows.len());
+                self.select_row(next);
             }
             Focus::Log => self.log_step(d),
         }
@@ -1552,6 +1675,7 @@ impl App {
         self.sidebar_selected = View::ALL.iter().position(|x| *x == v).unwrap_or(0);
         self.selected = 0;
         self.rebuild_rows();
+        self.sync_log_target();
     }
 
     fn primary_action(&mut self) {
@@ -1626,6 +1750,9 @@ impl App {
         {
             Ok(id) => {
                 self.selected_log_id = Some(id.clone());
+                self.selected_log_pid = self.runner.managed.get(&id).map(|m| m.pid);
+                self.shown_log_id = Some(id.clone());
+                self.shown_log_pid = self.selected_log_pid;
                 self.enter_pane(Focus::Log);
                 self.log_follow = true;
                 self.sync_log_view();
@@ -1645,14 +1772,10 @@ impl App {
 
     pub fn stop_managed(&mut self, id: &str) -> Result<()> {
         let matched_java_pid = if let Some(m) = self.runner.managed.get(id) {
-            self.inv.running.iter().find_map(|a| {
-                let matches = a.pid == m.pid
-                    || (self
-                        .match_running_project(a)
-                        .is_some_and(|pi| self.inv.projects[pi].path == m.project_path))
-                    || a.work_dir.as_deref() == Some(&m.project_path);
-                if matches { Some(a.pid) } else { None }
-            })
+            self.inv
+                .running
+                .iter()
+                .find_map(|a| self.managed_matches_running(m, a).then_some(a.pid))
         } else {
             None
         };
@@ -1757,7 +1880,9 @@ impl App {
 
     fn reset_log_stream(&mut self) {
         self.selected_log_id = None;
+        self.selected_log_pid = None;
         self.shown_log_id = None;
+        self.shown_log_pid = None;
         self.visual_anchor = None;
         self.log_scroll = 0;
         self.log_cursor = 0;
@@ -1820,7 +1945,6 @@ impl App {
             );
         } else if let Some(pid) = row_pid
             && let Some(state) = self.file_logs.get_mut(&id)
-            && state.pid.is_none()
         {
             state.pid = Some(pid);
         }
@@ -1842,15 +1966,22 @@ impl App {
         }
     }
 
-    /// Follow the cursor: when the selected row points at another stream, drop
-    /// the old scroll position, visual selection and jump back to the live tail.
+    /// Follow the cursor: when the selected row points at another stream or pid,
+    /// drop the old scroll position, visual selection and jump back to live tail.
     fn sync_log_target(&mut self) {
         let id = self.current_log_id();
-        if id == self.shown_log_id {
+        let pid = if id.is_some() {
+            self.active_log_pid()
+        } else {
+            None
+        };
+        if id == self.shown_log_id && pid == self.shown_log_pid {
             return;
         }
         self.shown_log_id = id.clone();
+        self.shown_log_pid = pid;
         self.selected_log_id = id;
+        self.selected_log_pid = pid;
         self.visual_anchor = None;
         self.log_follow = true;
         self.sync_log_view();
@@ -1900,13 +2031,13 @@ impl App {
                     self.enter_pane(Focus::Sidebar);
                 } else if in_rect(self.hitboxes.list, x, y) {
                     if y > self.hitboxes.list.y
-                        && y + 1 < self.hitboxes.list.y + self.hitboxes.list.height
+                        && y + 1 < self.hitboxes.list.height + self.hitboxes.list.y
                     {
                         let idx = self.list_scroll_offset + (y - self.hitboxes.list.y - 1) as usize;
                         if let Some(entry) = self.lines().get(idx)
                             && let Some(r) = entry.row
                         {
-                            self.selected = r;
+                            self.select_row(r);
                         }
                     }
                     self.enter_pane(Focus::List);
@@ -1922,12 +2053,18 @@ impl App {
             RowKind::App {
                 project: Some(pi),
                 pid,
-            } => format!(
-                "{}::{}::{:?}",
-                r.group,
-                self.inv.projects[pi].path.display(),
-                pid
-            ),
+            } => {
+                if r.group == "PROJECTS" {
+                    format!("PROJECTS::{}", self.inv.projects[pi].path.display())
+                } else {
+                    format!(
+                        "{}::{}::{:?}",
+                        r.group,
+                        self.inv.projects[pi].path.display(),
+                        pid
+                    )
+                }
+            }
             RowKind::App { project: None, pid } => {
                 format!("{}::{}::{:?}", r.group, r.label, pid)
             }
@@ -1967,4 +2104,190 @@ fn in_rect(r: Rect, x: u16, y: u16) -> bool {
         && x < r.x.saturating_add(r.width)
         && y >= r.y
         && y < r.y.saturating_add(r.height)
+}
+
+struct SharedPeer {
+    pid: u32,
+    ports: Vec<u16>,
+    main_short: Option<String>,
+    names: Vec<String>,
+}
+
+struct SharedMatcher {
+    pid: u32,
+    pid_str: String,
+    ports: Vec<u16>,
+    main_short: Option<String>,
+    names: Vec<String>,
+}
+
+fn build_shared_matchers(peers: &[SharedPeer]) -> Vec<SharedMatcher> {
+    peers
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let unique_ports = p
+                .ports
+                .iter()
+                .copied()
+                .filter(|port| {
+                    peers
+                        .iter()
+                        .enumerate()
+                        .all(|(j, o)| j == i || !o.ports.contains(port))
+                })
+                .collect();
+            let unique_main = p
+                .main_short
+                .as_ref()
+                .filter(|mc| {
+                    peers
+                        .iter()
+                        .enumerate()
+                        .all(|(j, o)| j == i || o.main_short.as_ref() != Some(*mc))
+                })
+                .cloned();
+            let unique_names = p
+                .names
+                .iter()
+                .filter(|n| {
+                    n.len() >= 3
+                        && peers.iter().enumerate().all(|(j, o)| {
+                            j == i || !o.names.iter().any(|on| on == *n || on.contains(n.as_str()))
+                        })
+                })
+                .cloned()
+                .collect();
+            SharedMatcher {
+                pid: p.pid,
+                pid_str: p.pid.to_string(),
+                ports: unique_ports,
+                main_short: unique_main,
+                names: unique_names,
+            }
+        })
+        .collect()
+}
+
+fn starts_with_log_timestamp(line: &str) -> bool {
+    let b = line.as_bytes();
+    let full_date = b.len() >= 19
+        && b[0..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[7] == b'-';
+    let time_only = b.len() >= 8
+        && b[0..2].iter().all(u8::is_ascii_digit)
+        && b[2] == b':'
+        && b[3..5].iter().all(u8::is_ascii_digit)
+        && b[5] == b':';
+    full_date || time_only
+}
+
+fn has_boundary_token(haystack_lower: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return false;
+    }
+    let hb = haystack_lower.as_bytes();
+    let nlen = needle_lower.len();
+    let is_word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_';
+    let mut start = 0;
+    while let Some(rel) = haystack_lower[start..].find(needle_lower) {
+        let idx = start + rel;
+        let before_ok = idx == 0 || !is_word(hb[idx - 1]);
+        let after = idx + nlen;
+        let after_ok = after == hb.len() || !is_word(hb[after]);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = idx + 1;
+    }
+    false
+}
+
+/// Returns `(thread_port_match, body_port_match)`. Thread pools like
+/// `[http-nio-7017-exec-6]` positively identify the owning JVM thread.
+fn match_port_markers(line: &str, lower: &str, port: u16) -> (bool, bool) {
+    let p_str = port.to_string();
+    let thread_dash = format!("-{p_str}-");
+    let thread_end = format!("-{p_str}]");
+    if line.contains(&thread_dash) || line.contains(&thread_end) {
+        return (true, true);
+    }
+    let lb = lower.as_bytes();
+    let plen = p_str.len();
+    let mut start = 0;
+    while let Some(rel) = lower[start..].find(&p_str) {
+        let idx = start + rel;
+        let after = idx + plen;
+        let after_ok = after == lb.len() || !lb[after].is_ascii_alphanumeric();
+        if after_ok && idx > 0 {
+            let prev = lb[idx - 1];
+            let has_colon = prev == b':' && (idx < 2 || !lb[idx - 2].is_ascii_digit() || port > 59);
+            let has_port_word = lower[..idx].ends_with("port ")
+                || lower[..idx].ends_with("port:")
+                || lower[..idx].ends_with("port=")
+                || lower[..idx].ends_with("port(s): ");
+            if has_colon || has_port_word {
+                return (false, true);
+            }
+        }
+        start = idx + 1;
+    }
+    (false, false)
+}
+
+fn match_pid_marker(line_lower: &str, pid_str: &str) -> bool {
+    let lb = line_lower.as_bytes();
+    let plen = pid_str.len();
+    let mut start = 0;
+    while let Some(rel) = line_lower[start..].find(pid_str) {
+        let idx = start + rel;
+        let after = idx + plen;
+        let after_ok = after == lb.len() || !lb[after].is_ascii_alphanumeric();
+        let before_ok = idx > 0 && {
+            let prefix = &line_lower[..idx];
+            prefix.ends_with("pid ") || prefix.ends_with("pid=") || prefix.ends_with('[')
+        };
+        if before_ok && after_ok {
+            return true;
+        }
+        start = idx + 1;
+    }
+    false
+}
+
+fn classify_shared_line(line: &str, target_idx: usize, matchers: &[SharedMatcher]) -> Option<u32> {
+    let lower = line.to_lowercase();
+    let mut body_hits: Vec<u32> = Vec::new();
+    for m in matchers {
+        let pid_hit = match_pid_marker(&lower, &m.pid_str);
+        let main_hit = m
+            .main_short
+            .as_deref()
+            .is_some_and(|mc| has_boundary_token(&lower, &mc.to_lowercase()));
+        let mut thread_port_hit = false;
+        let mut body_port_hit = false;
+        for &port in &m.ports {
+            let (tp, bp) = match_port_markers(line, &lower, port);
+            thread_port_hit |= tp;
+            body_port_hit |= bp;
+        }
+        // Thread/startup identity always belongs to the JVM executing that line.
+        if pid_hit || main_hit || thread_port_hit {
+            return Some(m.pid);
+        }
+        let name_hit = m.names.iter().any(|n| has_boundary_token(&lower, n));
+        if body_port_hit || name_hit {
+            body_hits.push(m.pid);
+        }
+    }
+    if body_hits.len() == 1 {
+        return Some(body_hits[0]);
+    }
+    let target_pid = matchers[target_idx].pid;
+    if body_hits.contains(&target_pid) && body_hits.len() > 1 {
+        return Some(target_pid);
+    }
+    None
 }

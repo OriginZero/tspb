@@ -126,6 +126,7 @@ impl RunState {
 #[derive(Clone, Debug)]
 pub struct RunningApp {
     pub pid: u32,
+    pub ancestor_pids: Vec<u32>,
     pub main_class: String,
     pub name: String,
     pub jdk_home: Option<PathBuf>,

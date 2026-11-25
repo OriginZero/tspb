@@ -754,6 +754,66 @@ pub fn read_file_tail(path: &Path, max_lines: usize) -> std::io::Result<Vec<Stri
     Ok(lines.into_iter().skip(skip).map(String::from).collect())
 }
 
+/// Read `spring.application.name` from `application.{yml,yaml,properties}` under `project_dir`.
+pub fn spring_app_name(project_dir: &Path) -> Option<String> {
+    let mut dirs = Vec::new();
+    let mut config_prefixes = Vec::new();
+    let mut app_prefixes = Vec::new();
+    collect_spring_configs(
+        project_dir,
+        &mut dirs,
+        &mut config_prefixes,
+        &mut app_prefixes,
+        false,
+    );
+    app_prefixes.into_iter().next()
+}
+
+fn collect_spring_configs(
+    p: &Path,
+    dirs: &mut Vec<PathBuf>,
+    config_prefixes: &mut Vec<String>,
+    app_prefixes: &mut Vec<String>,
+    include_xml: bool,
+) {
+    let res_dir = p.join("src").join("main").join("resources");
+    for dir in [&res_dir, p] {
+        if !dir.is_dir() {
+            continue;
+        }
+        if include_xml {
+            for name in [
+                "logback-spring.xml",
+                "logback.xml",
+                "log4j2-spring.xml",
+                "log4j2.xml",
+            ] {
+                let xml_file = dir.join(name);
+                if let Ok(raw) = fs::read_to_string(&xml_file) {
+                    extract_logback_info(&raw, p, dirs, config_prefixes);
+                }
+            }
+        }
+        for (name, is_props) in [
+            ("application.yml", false),
+            ("application.yaml", false),
+            ("application.properties", true),
+        ] {
+            let cfg_file = dir.join(name);
+            if let Ok(raw) = fs::read_to_string(&cfg_file) {
+                extract_spring_config_log_info(
+                    &raw,
+                    is_props,
+                    p,
+                    dirs,
+                    config_prefixes,
+                    app_prefixes,
+                );
+            }
+        }
+    }
+}
+
 /// Discover the most relevant active log file for a running application or project.
 pub fn find_log_file(
     project_path: Option<&Path>,
@@ -772,40 +832,7 @@ pub fn find_log_file(
 
     // 1. Check project configuration files (logback, log4j2, application.yml/.properties)
     if let Some(p) = project_path {
-        let res_dir = p.join("src").join("main").join("resources");
-        for dir in [&res_dir, p] {
-            if !dir.is_dir() {
-                continue;
-            }
-            for name in [
-                "logback-spring.xml",
-                "logback.xml",
-                "log4j2-spring.xml",
-                "log4j2.xml",
-            ] {
-                let xml_file = dir.join(name);
-                if let Ok(raw) = fs::read_to_string(&xml_file) {
-                    extract_logback_info(&raw, p, &mut dirs, &mut config_prefixes);
-                }
-            }
-            for (name, is_props) in [
-                ("application.yml", false),
-                ("application.yaml", false),
-                ("application.properties", true),
-            ] {
-                let cfg_file = dir.join(name);
-                if let Ok(raw) = fs::read_to_string(&cfg_file) {
-                    extract_spring_config_log_info(
-                        &raw,
-                        is_props,
-                        p,
-                        &mut dirs,
-                        &mut config_prefixes,
-                        &mut app_prefixes,
-                    );
-                }
-            }
-        }
+        collect_spring_configs(p, &mut dirs, &mut config_prefixes, &mut app_prefixes, true);
     }
 
     // 2. JVM command line arguments (e.g. -Dlogging.file.name, -DLOG_HOME)

@@ -211,7 +211,10 @@ impl Runner {
     }
 
     pub fn find_by_project(&self, path: &Path) -> Option<&Managed> {
-        self.managed.values().find(|m| m.project_path == path)
+        self.managed
+            .values()
+            .filter(|m| m.project_path == path)
+            .max_by_key(|m| matches!(m.state, RunState::Starting | RunState::Running))
     }
 
     /// Cheap line count for cursor/scroll math (avoids cloning the buffer).

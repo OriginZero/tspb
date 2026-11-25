@@ -403,24 +403,34 @@ fn render_detail(f: &mut Frame<'_>, area: Rect, app: &App) {
                     RowKind::App { pid: Some(p), .. } => Some(p),
                     _ => None,
                 })
+                .or(app.selected_log_pid)
                 .unwrap_or(0);
-            (pid, app.log_len_of(&id), Some(id))
+            let shared_counts = app.shared_log_counts(&id);
+            let len = shared_counts
+                .map(|(matched, _)| matched)
+                .unwrap_or_else(|| app.log_len_of(&id));
+            (pid, len, Some(id), shared_counts)
         } else {
             (
                 app.runner.managed.get(&id).map(|m| m.pid).unwrap_or(0),
                 app.log_len_of(&id),
                 None,
+                None,
             )
         }
     });
     let log_line = match live {
-        Some((pid, lines, maybe_file)) => {
+        Some((pid, lines, maybe_file, shared_counts)) => {
             let file_desc = if let Some(fid) = maybe_file {
                 let fname = std::path::Path::new(&fid["file://".len()..])
                     .file_name()
                     .map(|f| f.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "file".to_string());
-                format!("(file: {fname})  ")
+                if let Some((matched, total_raw)) = shared_counts {
+                    format!("(shared: {fname}, {matched}/{total_raw})  ")
+                } else {
+                    format!("(file: {fname})  ")
+                }
             } else {
                 String::new()
             };
@@ -582,19 +592,41 @@ fn render_log(f: &mut Frame<'_>, area: Rect, app: &App) {
     if let Some(id) = &id {
         let raw = app.logs_for(id);
         total = raw.len();
+        let shared_counts = app.shared_log_counts(id);
         if let Some(path_str) = id.strip_prefix("file://") {
             let filename = std::path::Path::new(path_str)
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "file".to_string());
-            let pid_str = app
+            let pid_val = app
                 .current_row()
                 .and_then(|r| match r.kind {
-                    RowKind::App { pid: Some(p), .. } => Some(format!("pid {p} ")),
+                    RowKind::App { pid: Some(p), .. } => Some(p),
                     _ => None,
                 })
-                .unwrap_or_default();
-            title = format!(" LOG  {pid_str}[{filename}] ");
+                .or(app.selected_log_pid);
+            let pid_str = pid_val.map(|p| format!("pid {p} ")).unwrap_or_default();
+            let shared_note = match shared_counts {
+                Some((matched, total_raw)) => format!(" · shared {matched}/{total_raw}"),
+                None => String::new(),
+            };
+            title = format!(" LOG  {pid_str}[{filename}{shared_note}] ");
+            if raw.is_empty()
+                && let Some((_, total_raw)) = shared_counts
+                && total_raw > 0
+            {
+                let pid_label = pid_val.unwrap_or(0);
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "Shared log [{filename}] has 0/{total_raw} lines matching pid {pid_label} yet."
+                    ),
+                    Style::default().fg(Color::Yellow),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "Send a request to this service, or launch it from PROJECTS for isolated stdout.",
+                    Style::default().fg(DIM),
+                )));
+            }
         } else {
             title = format!(
                 " LOG  pid {} ",
